@@ -678,34 +678,11 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 		GOTO(out, rc = PTR_ERR(fo));
 	LASSERT(fo != NULL);
 
-	ofd_read_lock(env, fo);
 	if (!ofd_object_exists(fo)) {
 		CERROR("%s: BRW to missing obj "DOSTID"\n",
 		       exp->exp_obd->obd_name, POSTID(&obj->ioo_oid));
-		ofd_read_unlock(env, fo);
 		ofd_object_put(env, fo);
 		GOTO(out, rc = -ENOENT);
-	}
-
-	if (ofd->ofd_lfsck_verify_pfid && oa->o_valid & OBD_MD_FLFID) {
-		rc = ofd_verify_ff(env, fo, oa);
-		if (rc != 0) {
-			ofd_read_unlock(env, fo);
-			ofd_object_put(env, fo);
-			GOTO(out, rc);
-		}
-	}
-
-	/* need to verify layout version */
-	if (oa->o_valid & OBD_MD_LAYOUT_VERSION) {
-		rc = ofd_verify_layout_version(env, fo, oa);
-		if (rc) {
-			ofd_read_unlock(env, fo);
-			ofd_object_put(env, fo);
-			GOTO(out, rc);
-		}
-
-		oa->o_valid &= ~OBD_MD_LAYOUT_VERSION;
 	}
 
 	if (ptlrpc_connection_is_local(exp->exp_connection))
@@ -718,7 +695,7 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 		rc = dt_bufs_get(env, ofd_object_child(fo),
 				 rnb + i, lnb + j, maxlnb, dbt);
 		if (unlikely(rc < 0))
-			GOTO(err, rc);
+			GOTO(err_nolock, rc);
 		LASSERT(rc <= PTLRPC_MAX_BRW_PAGES);
 		/* correct index for local buffers to continue with */
 		for (k = 0; k < rc; k++) {
@@ -735,6 +712,27 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 	}
 	LASSERT(*nr_local > 0 && *nr_local <= PTLRPC_MAX_BRW_PAGES);
 
+	ofd_read_lock(env, fo);
+	if (!ofd_object_exists(fo)) {
+		CERROR("%s: BRW to missing obj "DOSTID"\n",
+		       exp->exp_obd->obd_name, POSTID(&obj->ioo_oid));
+		GOTO(err, rc = -ENOENT);
+	}
+
+	if (ofd->ofd_lfsck_verify_pfid && oa->o_valid & OBD_MD_FLFID) {
+		rc = ofd_verify_ff(env, fo, oa);
+		if (rc != 0)
+			GOTO(err, rc);
+	}
+
+	/* need to verify layout version */
+	if (oa->o_valid & OBD_MD_LAYOUT_VERSION) {
+		rc = ofd_verify_layout_version(env, fo, oa);
+		if (rc)
+			GOTO(err, rc);
+		oa->o_valid &= ~OBD_MD_LAYOUT_VERSION;
+	}
+
 	rc = dt_write_prep(env, ofd_object_child(fo), lnb, *nr_local);
 	if (unlikely(rc != 0))
 		GOTO(err, rc);
@@ -743,8 +741,9 @@ static int ofd_preprw_write(const struct lu_env *env, struct obd_export *exp,
 	ofd_counter_incr(exp, LPROC_OFD_STATS_WRITE, jobid, tot_bytes);
 	RETURN(0);
 err:
-	dt_bufs_put(env, ofd_object_child(fo), lnb, *nr_local);
 	ofd_read_unlock(env, fo);
+err_nolock:
+	dt_bufs_put(env, ofd_object_child(fo), lnb, *nr_local);
 	ofd_object_put(env, fo);
 	/* tgt_grant_prepare_write() was called, so we must commit */
 	tgt_grant_commit(exp, oa->o_grant_used, rc);

@@ -848,6 +848,9 @@ static int osd_bufs_get(const struct lu_env *env, struct dt_object *dt,
 
 	LASSERT(obj->oo_inode);
 
+	if (unlikely(obj->oo_destroyed))
+		RETURN(-ENOENT);
+
 	if (!osd_use_page_cache(osd_obj2dev(obj))) {
 		if (unlikely(!oti->oti_dio_pages)) {
 			OBD_ALLOC(oti->oti_dio_pages,
