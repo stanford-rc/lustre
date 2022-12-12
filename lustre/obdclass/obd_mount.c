@@ -499,7 +499,7 @@ out_free:
 }
 EXPORT_SYMBOL(lustre_start_mgc);
 
-static int lustre_stop_mgc(struct super_block *sb)
+int lustre_stop_mgc(struct super_block *sb)
 {
 	struct lustre_sb_info *lsi = s2lsi(sb);
 	struct obd_device *obd;
@@ -567,6 +567,7 @@ out:
 	mutex_unlock(&mgc_start_lock);
 	RETURN(rc);
 }
+EXPORT_SYMBOL(lustre_stop_mgc);
 
 /***************** lustre superblock **************/
 

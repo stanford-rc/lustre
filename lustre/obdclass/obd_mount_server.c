@@ -1647,7 +1647,9 @@ static void server_put_super(struct super_block *sb)
 	}
 
 	/* If they wanted the mgs to stop separately from the mdt, they
-	   should have put it on a different device. */
+	 * should have put it on a different device.
+	 */
+	lustre_stop_mgc(sb);
 	if (IS_MGS(lsi)) {
 		/* if MDS start with --nomgs, don't stop MGS then */
 		if (!(lsi->lsi_lmd->lmd_flags & LMD_FLG_NOMGS))
@@ -1659,8 +1661,8 @@ static void server_put_super(struct super_block *sb)
 			CERROR("%s: failed to stop lwp!\n", tmpname);
 	}
 
-	/* Clean the mgc and sb */
-	lustre_common_put_super(sb);
+	/* Drop a ref to the mounted disk */
+	lustre_put_lsi(sb);
 
 	/* wait till all in-progress cleanups are done
 	 * specifically we're interested in ofd cleanup
