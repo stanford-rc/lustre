@@ -185,6 +185,7 @@ static struct ll_sb_info *ll_init_sbi(void)
 	set_bit(LL_SBI_FAST_READ, sbi->ll_flags);
 	set_bit(LL_SBI_TINY_WRITE, sbi->ll_flags);
 	set_bit(LL_SBI_PARALLEL_DIO, sbi->ll_flags);
+	set_bit(LL_SBI_STATFS_PROJECT, sbi->ll_flags);
 	ll_sbi_set_encrypt(sbi, true);
 	ll_sbi_set_name_encrypt(sbi, true);
 
@@ -968,6 +969,8 @@ static const match_table_t ll_sbi_flags_name = {
 	{LL_SBI_ENCRYPT,		"encrypt"},
 	{LL_SBI_ENCRYPT,		"noencrypt"},
 	{LL_SBI_FOREIGN_SYMLINK,	"foreign_symlink=%s"},
+	{LL_SBI_STATFS_PROJECT, 	"statfs_project"},
+	{LL_SBI_STATFS_PROJECT, 	"nostatfs_project"},
 	{LL_SBI_NUM_MOUNT_OPT,		NULL},
 
 	{LL_SBI_ACL,			"acl"},
@@ -1090,6 +1093,7 @@ static int ll_options(char *options, struct super_block *sb)
 		case LL_SBI_LRU_RESIZE:
 		case LL_SBI_LAZYSTATFS:
 		case LL_SBI_VERBOSE:
+		case LL_SBI_STATFS_PROJECT:
 			if (turn_off)
 				clear_bit(token, sbi->ll_flags);
 			else
@@ -2611,7 +2615,8 @@ int ll_statfs(struct dentry *de, struct kstatfs *sfs)
 	sfs->f_fsid.val[0] = (__u32)fsid;
 	sfs->f_fsid.val[1] = (__u32)(fsid >> 32);
 	sfs->f_namelen = sbi->ll_namelen;
-	if (ll_i2info(de->d_inode)->lli_projid)
+	if (ll_i2info(de->d_inode)->lli_projid &&
+		test_bit(LL_SBI_STATFS_PROJECT, sbi->ll_flags))
 		return ll_statfs_project(de->d_inode, sfs);
 
 	ll_stats_ops_tally(sbi, LPROC_LL_STATFS,
