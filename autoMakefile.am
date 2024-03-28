@@ -24,6 +24,11 @@ FIND_TAG_FILES_CMD = find $(top_srcdir) \
 		     -path $(top_srcdir)/ldiskfs/linux-stage \
 		     -prune -false -o -type f -name '*.[hc]'
 
+utils:
+	$(MAKE) -C libcfs/libcfs/util
+	$(MAKE) -C lnet/utils
+	$(MAKE) -C lustre/utils
+
 # these empty rules are needed so that automake doesn't add its own
 # recursive rules
 etags-recursive:
