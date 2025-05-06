@@ -433,6 +433,12 @@ struct osd_thandle {
 	/* Link to the device, for debugging. */
 	struct lu_ref_link      ot_dev_link;
 	unsigned int		ot_credits;
+	/*
+	 * For iterative operation within one transaction,
+	 * for example fallocate, it is a number of credits
+	 * enough for completing at least one iteration.
+	 */
+	unsigned int		ot_credits_iter;
 	unsigned int		oh_declared_ext;
 
 	/* quota IDs related to the transaction */
@@ -608,6 +614,7 @@ struct osd_iobuf {
 };
 
 #define osd_dirty_inode(inode, flag)  (inode)->i_sb->s_op->dirty_inode((inode), flag)
+#define osd_i_blocks(inode, size) ((size) >> (inode)->i_blkbits)
 
 #ifndef HAVE_ALLOC_FILE_PSEUDO
 
