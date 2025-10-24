@@ -2556,5 +2556,129 @@ test_25() {
 run_test 25 "Verify old lov stripe API with PFL files"
 
 complete $SECONDS
+
+test_26a() {
+	$LFS setstripe -E 1m -S 1M -c 1 $DIR/$tfile
+	dd if=/dev/urandom bs=1M count=10 >> $DIR/$tfile
+	[ $? != 0 ] || error "append must return an error"
+	dd if=/dev/urandom bs=1M count=10 oflag=direct >> $DIR/$tfile
+	[ $? != 0 ] || error "append must return an error"
+}
+run_test 26a "Append to not-existent component"
+
+test_26b() {
+	$LFS setstripe -E 1m -S 1M -c 1 $DIR/$tfile
+	dd if=/dev/urandom bs=1M count=1 > $DIR/$tfile
+	dd if=/dev/urandom bs=1M count=1 >> $DIR/$tfile
+	[ $? != 0 ] || error "append must return an error"
+	dd if=/dev/urandom bs=1M count=1 oflag=direct >> $DIR/$tfile
+	[ $? != 0 ] || error "append must return an error"
+}
+run_test 26b "Append to not-existend component, file size is unknown"
+
+test_26c() {
+	$LFS setstripe -E 1m -S 1M -c 1 $DIR/$tfile
+	dd if=/dev/urandom bs=2M count=1 >> $DIR/$tfile
+	[ $? != 0 ] || error "append must return an error"
+	dd if=/dev/urandom bs=2M count=1 oflag=direct >> $DIR/$tfile
+	[ $? != 0 ] || error "append must return an error"
+}
+run_test 26c "Append to not-existend component, crossing the component border"
+
+test_27() {
+	[[ $($LCTL get_param mdc.*.import) =~ connect_flags.*overstriping ]] ||
+		skip "server does not support overstriping"
+	(( $MDS1_VERSION >= $(version_code 2.15.55.102) )) ||
+		skip "need MDS >= 2.12.55.102 for mdt_dump_lmm fix"
+
+	stack_trap "rm -f $DIR/$tfile"
+	# start_full_debug_logging
+	$LFS setstripe -S 64K -C -1 $DIR/$tfile || error "create $tfile failed"
+	$LFS getstripe -c $DIR/$tfile || error "getstripe $tfile failed"
+	cancel_lru_locks
+	$LFS getstripe -c $DIR/$tfile || error "getstripe failed after clear"
+
+	test_mkdir $DIR/$tdir
+	stack_trap "rm -rf $DIR/$tdir/$tfile"
+	$LFS setstripe -S 64K -C -1 $DIR/$tdir || error "mkdir $tdir failed"
+	$LFS getstripe -y $DIR/$tdir || error "getstripe $tdir failed"
+	touch $DIR/$tdir/$tfile || error "create $tdir/$tfile failed"
+	cancel_lru_locks
+	$LFS getstripe -c $DIR/$tdir/$tfile ||
+		error "getstripe $tdir/$tfile failed"
+	#stop_full_debug_logging
+}
+run_test 27 "overstriping with -C -1 in mdt_dump_lmm"
+
+test_28() { # LU-19519
+	[ $OSTCOUNT -lt 2 ] && skip "needs >= 2 OSTs"
+
+	local file=$DIR/$tdir/$tfile
+	local pool="testpool"
+
+	test_mkdir -p $DIR/$tdir
+	stack_trap "rm -f $file"
+
+	# Create a pool with OST0 and OST1
+	pool_add $pool || error "pool_add $pool failed"
+	stack_trap "destroy_test_pools"
+	pool_add_targets $pool 0 1 || error "pool_add_targets failed"
+
+	# Create a PFL file with two components using explicit OST indices:
+	# - First component: 0-1M, will be instantiated on OST0
+	# - Second component: 1M-EOF, will remain uninitialized on OST1
+	$LFS setstripe -E 1M -c 1 -i 0 -p $pool \
+		       -E -1 -c 1 -i 1 -p $pool $file ||
+		error "create PFL file $file failed"
+
+	# Write some data to first component only (512K, within 1M boundary)
+	dd if=/dev/zero of=$file bs=512K count=1 conv=notrunc ||
+		error "write to $file failed"
+
+	# Verify layout: first component should be init, second should not
+	local comp1_flags=$($LFS getstripe -I1 --component-flags $file)
+	local comp2_flags=$($LFS getstripe -I2 --component-flags $file)
+
+	[[ "$comp1_flags" == "init" ]] ||
+		error "component 1 should be init, got: $comp1_flags"
+	[[ "$comp2_flags" == "0" ]] ||
+		error "component 2 should be uninit (0), got: $comp2_flags"
+
+	# Get the stripe offset of the uninitialized component
+	local comp2_ost=$($LFS getstripe -I2 -i $file)
+	echo "Uninitialized component 2 has stripe offset: $comp2_ost"
+	[[ $comp2_ost -eq 1 ]] ||
+		error "expected comp2 on OST1, got OST$comp2_ost"
+
+	# Now remove OST1 from the pool, making the uninitialized
+	# component's stripe offset invalid for the pool
+	pool_remove_target $pool 1 ||
+		error "pool_remove_target $pool 1 failed"
+
+	# Verify the pool no longer contains OST1
+	local pool_osts=$(do_facet mds1 $LCTL pool_list $FSNAME.$pool |
+			  grep "^$FSNAME-OST")
+	echo "Pool now contains: $pool_osts"
+	[[ "$pool_osts" =~ "OST0001" ]] &&
+		error "pool should not contain OST1"
+
+	# Now try to migrate the file - this should succeed with the fix
+	# The uninitialized component with invalid stripe offset should not
+	# block migration
+	$LFS migrate -c 1 $file || error "migrate $file failed"
+
+	# Verify the file is now a plain layout (component count should be 0)
+	local comp_count=$($LFS getstripe --component-count $file)
+	[[ $comp_count -eq 0 ]] ||
+		error "expected plain layout, got $comp_count components"
+
+	# Verify data integrity
+	local size=$(stat -c%s $file)
+	[[ $size -eq 524288 ]] ||
+		error "file size changed: expected 524288, got $size"
+}
+run_test 28 "migrate PFL file with uninitialized component on invalid OST"
+
+complete_test $SECONDS
 check_and_cleanup_lustre
 exit_status
