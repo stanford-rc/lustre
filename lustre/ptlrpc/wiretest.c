@@ -2575,6 +2575,10 @@ void lustre_assert_wire_constants(void)
 		(unsigned)MDS_MIGRATE_NSONLY);
 	LASSERTF(MDS_CREATE_DEFAULT_LMV == 0x01000000UL, "found 0x%.8xUL\n",
 		(unsigned)MDS_CREATE_DEFAULT_LMV);
+	LASSERTF(MDS_CLOSE_LAYOUT_SWAP_HSM == 0x02000000UL, "found 0x%.8xUL\n",
+		(unsigned)MDS_CLOSE_LAYOUT_SWAP_HSM);
+	LASSERTF(MDS_NAMEHASH == 0x04000000UL, "found 0x%.8xUL\n",
+		(unsigned)MDS_NAMEHASH);
 
 	/* Checks for struct mdt_body */
 	LASSERTF((int)sizeof(struct mdt_body) == 216, "found %lld\n",
@@ -4529,7 +4533,7 @@ void lustre_assert_wire_constants(void)
 		 (long long)(int)sizeof(*((struct rsi_downcall_data *)0)->sid_val));
 
 	/* Checks for struct rsc_downcall_data */
-	LASSERTF((int)sizeof(struct rsc_downcall_data) == 48, "found %lld\n",
+	LASSERTF((int)sizeof(struct rsc_downcall_data) == 72, "found %lld\n",
 		 (long long)(int)sizeof(struct rsc_downcall_data));
 	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_magic) == 0, "found %lld\n",
 		 (long long)(int)offsetof(struct rsc_downcall_data, scd_magic));
@@ -4559,19 +4563,23 @@ void lustre_assert_wire_constants(void)
 		 (long long)(int)offsetof(struct rsc_downcall_data, scd_mechname));
 	LASSERTF((int)sizeof(((struct rsc_downcall_data *)0)->scd_mechname) == 8, "found %lld\n",
 		 (long long)(int)sizeof(((struct rsc_downcall_data *)0)->scd_mechname));
-	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_offset) == 32, "found %lld\n",
+	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_nmname) == 32, "found %lld\n",
+		 (long long)(int)offsetof(struct rsc_downcall_data, scd_nmname));
+	LASSERTF((int)sizeof(((struct rsc_downcall_data *)0)->scd_nmname) == 24, "found %lld\n",
+		 (long long)(int)sizeof(((struct rsc_downcall_data *)0)->scd_nmname));
+	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_offset) == 56, "found %lld\n",
 		 (long long)(int)offsetof(struct rsc_downcall_data, scd_offset));
 	LASSERTF((int)sizeof(((struct rsc_downcall_data *)0)->scd_offset) == 8, "found %lld\n",
 		 (long long)(int)sizeof(((struct rsc_downcall_data *)0)->scd_offset));
-	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_len) == 40, "found %lld\n",
+	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_len) == 64, "found %lld\n",
 		 (long long)(int)offsetof(struct rsc_downcall_data, scd_len));
 	LASSERTF((int)sizeof(((struct rsc_downcall_data *)0)->scd_len) == 4, "found %lld\n",
 		 (long long)(int)sizeof(((struct rsc_downcall_data *)0)->scd_len));
-	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_padding) == 44, "found %lld\n",
+	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_padding) == 68, "found %lld\n",
 		 (long long)(int)offsetof(struct rsc_downcall_data, scd_padding));
 	LASSERTF((int)sizeof(((struct rsc_downcall_data *)0)->scd_padding) == 4, "found %lld\n",
 		 (long long)(int)sizeof(((struct rsc_downcall_data *)0)->scd_padding));
-	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_val) == 48, "found %lld\n",
+	LASSERTF((int)offsetof(struct rsc_downcall_data, scd_val) == 72, "found %lld\n",
 		 (long long)(int)offsetof(struct rsc_downcall_data, scd_val));
 	LASSERTF((int)sizeof(*((struct rsc_downcall_data *)0)->scd_val) == 1, "found %lld\n",
 		 (long long)(int)sizeof(*((struct rsc_downcall_data *)0)->scd_val));
@@ -4784,10 +4792,14 @@ void lustre_assert_wire_constants(void)
 		 (long long)(int)offsetof(struct quota_body, qb_glb_lockh));
 	LASSERTF((int)sizeof(((struct quota_body *)0)->qb_glb_lockh) == 8, "found %lld\n",
 		 (long long)(int)sizeof(((struct quota_body *)0)->qb_glb_lockh));
-	LASSERTF((int)offsetof(struct quota_body, qb_padding1[4]) == 112, "found %lld\n",
-		 (long long)(int)offsetof(struct quota_body, qb_padding1[4]));
-	LASSERTF((int)sizeof(((struct quota_body *)0)->qb_padding1[4]) == 8, "found %lld\n",
-		 (long long)(int)sizeof(((struct quota_body *)0)->qb_padding1[4]));
+	LASSERTF((int)offsetof(struct quota_body, qb_glb_ver) == 80, "found %lld\n",
+		 (long long)(int)offsetof(struct quota_body, qb_glb_ver));
+	LASSERTF((int)sizeof(((struct quota_body *)0)->qb_glb_ver) == 8, "found %lld\n",
+		 (long long)(int)sizeof(((struct quota_body *)0)->qb_glb_ver));
+	LASSERTF((int)offsetof(struct quota_body, qb_padding1[3]) == 112, "found %lld\n",
+		 (long long)(int)offsetof(struct quota_body, qb_padding1[3]));
+	LASSERTF((int)sizeof(((struct quota_body *)0)->qb_padding1[3]) == 8, "found %lld\n",
+		 (long long)(int)sizeof(((struct quota_body *)0)->qb_padding1[3]));
 #endif /* HAVE_SERVER_SUPPORT */
 
 	/* Checks for struct mgs_target_info */

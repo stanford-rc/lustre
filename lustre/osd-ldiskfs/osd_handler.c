@@ -70,9 +70,6 @@ int ldiskfs_track_declares_assert;
 module_param(ldiskfs_track_declares_assert, int, 0644);
 MODULE_PARM_DESC(ldiskfs_track_declares_assert, "LBUG during tracking of declares");
 
-/* 1 GiB in 512-byte sectors */
-static int ldiskfs_delayed_unlink_blocks = (1 << (30 - 9));
-
 /* Slab to allocate dynlocks */
 struct kmem_cache *dynlock_cachep;
 
@@ -936,13 +933,10 @@ struct osd_check_lmv_buf {
  * \retval	0 continue to check next item
  * \retval	-ve for failure
  */
-#ifdef HAVE_FILLDIR_USE_CTX
 static FILLDIR_TYPE do_osd_stripe_dir_filldir(struct dir_context *buf,
-#else
-static int osd_stripe_dir_filldir(void *buf,
-#endif
-				  const char *name, int namelen,
-				  loff_t offset, __u64 ino, unsigned int d_type)
+					      const char *name, int namelen,
+					      loff_t offset, u64 ino,
+					      unsigned int d_type)
 {
 	struct osd_check_lmv_buf *oclb = (struct osd_check_lmv_buf *)buf;
 	struct osd_thread_info *oti = oclb->oclb_info;
@@ -2417,35 +2411,24 @@ static int osd_trans_cb_add(struct thandle *th, struct dt_txn_commit_cb *dcb)
 	return 0;
 }
 
-struct osd_delayed_iput_work {
-	struct work_struct diw_work;
-	struct inode	  *diw_inode;
-};
-
-static void osd_delayed_iput_fn(struct work_struct *work)
+static void osd_quota_refresh(const struct lu_env *env, struct qsd_instance *qsd,
+			      __u64 projid, qid_t uid, qid_t gid)
 {
-	struct osd_delayed_iput_work *diwork;
-	struct inode *inode;
+	struct osd_thread_info *info = osd_oti_get(env);
+	struct lquota_id_info *qi = &info->oti_qi;
 
-	diwork = container_of(work, struct osd_delayed_iput_work, diw_work);
-	inode = diwork->diw_inode;
-	CDEBUG(D_INODE, "%s: delayed iput (ino=%lu)\n",
-	       inode->i_sb->s_id, inode->i_ino);
-	iput(inode);
-	OBD_FREE_PTR(diwork);
-}
+	if (!qsd)
+		return;
 
-noinline static void osd_delayed_iput(struct inode *inode,
-				      struct osd_delayed_iput_work *diwork)
-{
-	if (!diwork) {
-		iput(inode);
-	} else {
-		INIT_WORK(&diwork->diw_work, osd_delayed_iput_fn);
-		diwork->diw_inode = inode;
-		queue_work(LDISKFS_SB(inode->i_sb)->s_misc_wq,
-			   &diwork->diw_work);
-	}
+	/* Release granted quota to master if necessary */
+	qi->lqi_id.qid_uid = uid;
+	qsd_op_adjust(env, qsd, &qi->lqi_id, USRQUOTA);
+
+	qi->lqi_id.qid_uid = gid;
+	qsd_op_adjust(env, qsd, &qi->lqi_id, GRPQUOTA);
+
+	qi->lqi_id.qid_uid = projid;
+	qsd_op_adjust(env, qsd, &qi->lqi_id, PRJQUOTA);
 }
 
 static void osd_drop_preallocated_space(struct osd_object *o)
@@ -2490,7 +2473,8 @@ static void osd_drop_preallocated_space(struct osd_object *o)
 
 	rc = osd_jbd_invalidate_page(LDISKFS_SB(inode->i_sb)->s_journal,
 				     page, 0, PAGE_SIZE);
-	LASSERTF(rc == 0, "  last page %lu %s%s rc=%d\n", page->index,
+	LASSERTF(rc == 0, "  last page %lu %s%s rc=%d\n",
+		 folio_index_page(page),
 		 PageChecked(page) ? "C" : "", PageDirty(page) ? "D" : "", rc);
 
 	unlock_page(page);
@@ -2507,9 +2491,8 @@ static void osd_drop_preallocated_space(struct osd_object *o)
 static void osd_object_delete(const struct lu_env *env, struct lu_object *l)
 {
 	struct osd_object *obj = osd_obj(l);
-	struct qsd_instance *qsd = osd_def_qsd(osd_obj2dev(obj));
+	struct osd_device *osd = osd_obj2dev(obj);
 	struct inode *inode = obj->oo_inode;
-	struct osd_delayed_iput_work *diwork = NULL;
 	__u64 projid;
 	qid_t uid;
 	qid_t gid;
@@ -2530,9 +2513,6 @@ static void osd_object_delete(const struct lu_env *env, struct lu_object *l)
 		obj->oo_on_orphan_list = 0;
 	}
 
-	if (inode->i_blocks > ldiskfs_delayed_unlink_blocks)
-		OBD_ALLOC(diwork, sizeof(*diwork));
-
 	if (osd_has_index(obj) &&  obj->oo_dt.do_index_ops == &osd_index_iam_ops)
 		ldiskfs_set_inode_flag(inode, LDISKFS_INODE_JOURNAL_DATA);
 
@@ -2541,7 +2521,7 @@ static void osd_object_delete(const struct lu_env *env, struct lu_object *l)
 	projid = i_projid_read(inode);
 
 	obj->oo_inode = NULL;
-	osd_delayed_iput(inode, diwork);
+	iput(inode);
 
 	/* do not rebalance quota if the caller needs to release memory
 	 * otherwise qsd_refresh_usage() may went into a new ldiskfs
@@ -2549,19 +2529,15 @@ static void osd_object_delete(const struct lu_env *env, struct lu_object *l)
 	if (current->flags & (PF_MEMALLOC | PF_KSWAPD))
 		return;
 
-	if (!obj->oo_header && qsd) {
-		struct osd_thread_info *info = osd_oti_get(env);
-		struct lquota_id_info *qi = &info->oti_qi;
+	if (obj->oo_destroyed) {
+		struct qsd_instance *qsd;
 
-		/* Release granted quota to master if necessary */
-		qi->lqi_id.qid_uid = uid;
-		qsd_op_adjust(env, qsd, &qi->lqi_id, USRQUOTA);
+		CDEBUG(D_QUOTA, " %p ino=%lu\n", inode, inode->i_ino);
+		qsd = osd->od_quota_slave_dt;
+		osd_quota_refresh(env, qsd, projid, uid, gid);
 
-		qi->lqi_id.qid_uid = gid;
-		qsd_op_adjust(env, qsd, &qi->lqi_id, GRPQUOTA);
-
-		qi->lqi_id.qid_uid = projid;
-		qsd_op_adjust(env, qsd, &qi->lqi_id, PRJQUOTA);
+		qsd = osd->od_quota_slave_md;
+		osd_quota_refresh(env, qsd, projid, uid, gid);
 	}
 }
 
@@ -3232,7 +3208,7 @@ static int osd_declare_attr_set(const struct lu_env *env, struct dt_object *dt,
 		qid_t gid = U32_MAX;
 		qid_t projid = U32_MAX;
 
-		bspace = toqb(obj->oo_inode->i_blocks << 9);
+		bspace = stoqb(obj->oo_inode->i_blocks << 9);
 		if (attr->la_valid & LA_UID) {
 			uid = i_uid_read(obj->oo_inode);
 			rc = osd_declare_attr_qid(env, obj, oh, bspace, uid,
@@ -4107,15 +4083,12 @@ static int osd_declare_destroy(const struct lu_env *env, struct dt_object *dt,
 	struct osd_object *obj = osd_dt_obj(dt);
 	struct inode *inode = obj->oo_inode;
 	struct osd_thandle *oh;
-	long long	    space;
 	int rc;
 
 	ENTRY;
 
 	if (inode == NULL)
 		RETURN(-ENOENT);
-
-	space = -toqb(LDISKFS_I(inode)->i_disksize);
 
 	oh = container_of(th, struct osd_thandle, ot_super);
 	LASSERT(oh->ot_handle == NULL);
@@ -4142,7 +4115,7 @@ static int osd_declare_destroy(const struct lu_env *env, struct dt_object *dt,
 		RETURN(rc);
 	/* data to be truncated */
 	rc = osd_declare_inode_qid(env, i_uid_read(inode), i_gid_read(inode),
-				   i_projid_read(inode), space, oh, obj, NULL,
+				   i_projid_read(inode), 0, oh, obj, NULL,
 				   OSD_QID_BLK);
 	if (rc)
 		RETURN(rc);
@@ -7307,13 +7280,10 @@ struct osd_filldir_cbs {
  * \retval 0 on success
  * \retval 1 on buffer full
  */
-#ifdef HAVE_FILLDIR_USE_CTX
 static FILLDIR_TYPE do_osd_ldiskfs_filldir(struct dir_context *ctx,
-#else
-static int osd_ldiskfs_filldir(void *ctx,
-#endif
-			       const char *name, int namelen,
-			       loff_t offset, __u64 ino, unsigned int d_type)
+					   const char *name, int namelen,
+					   loff_t offset, u64 ino,
+					   unsigned int d_type)
 {
 	struct osd_it_ea *it = ((struct osd_filldir_cbs *)ctx)->it;
 	struct osd_object *obj = it->oie_obj;
@@ -8675,7 +8645,7 @@ static int osd_device_init0(const struct lu_env *env,
 	o->od_read_cache = 1;
 	o->od_writethrough_cache = 1;
 	o->od_enable_projid_xattr = 0;
-	o->od_readcache_max_filesize = OSD_MAX_CACHE_SIZE;
+	o->od_readcache_max_filesize = (totalram_pages() << PAGE_SHIFT) / 64;
 	o->od_readcache_max_iosize = OSD_READCACHE_MAX_IO_MB << 20;
 	o->od_writethrough_max_iosize = OSD_WRITECACHE_MAX_IO_MB << 20;
 	o->od_scrub.os_scrub.os_auto_scrub_interval = AS_DEFAULT;
@@ -8739,6 +8709,7 @@ static int osd_device_init0(const struct lu_env *env,
 	rc = lprocfs_init_brw_stats(&o->od_brw_stats);
 	if (rc)
 		GOTO(out_brw_stats, rc);
+	o->od_brw_stats.bs_devname = o->od_svname;
 
 	/* setup scrub, including OI files initialization */
 	o->od_in_init = 1;
@@ -9113,31 +9084,6 @@ static const struct obd_ops osd_obd_device_ops = {
 	.o_get_info	= osd_get_info,
 };
 
-static ssize_t delayed_unlink_mb_show(struct kobject *kobj,
-				      struct attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n",
-			ldiskfs_delayed_unlink_blocks >> 11);
-}
-
-static ssize_t delayed_unlink_mb_store(struct kobject *kobj,
-				       struct attribute *attr,
-				       const char *buffer, size_t count)
-{
-	u64 delayed_unlink_bytes;
-	int rc;
-
-	rc = sysfs_memparse(buffer, count, &delayed_unlink_bytes, "MiB");
-	if (rc)
-		return rc;
-
-	ldiskfs_delayed_unlink_blocks = delayed_unlink_bytes >> 9;
-
-	return count;
-}
-LUSTRE_RW_ATTR(delayed_unlink_mb);
-
-
 static ssize_t track_declares_assert_show(struct kobject *kobj,
 				   struct attribute *attr,
 				   char *buf)
@@ -9197,14 +9143,6 @@ static int __init osd_init(void)
 				       &lustre_attr_track_declares_assert.attr);
 		if (rc) {
 			CWARN("%s: track_declares_assert sysfs registration failed: rc = %d\n",
-			      "osd-ldiskfs", rc);
-			rc = 0;
-		}
-
-		rc = sysfs_create_file(kobj,
-				       &lustre_attr_delayed_unlink_mb.attr);
-		if (rc) {
-			CWARN("%s: delayed_unlink_mb registration failed: rc = %d\n",
 			      "osd-ldiskfs", rc);
 			rc = 0;
 		}

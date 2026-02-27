@@ -889,6 +889,11 @@ static int osd_declare_write_commit(const struct lu_env *env,
 		    (lnb[i].lnb_flags & OBD_BRW_SYS_RESOURCE) ||
 		    !(lnb[i].lnb_flags & OBD_BRW_SYNC))
 			declare_flags |= OSD_QID_FORCE;
+		/* ASYNC means that the page comes from the cache - it must be
+		 * written anyway.
+		 */
+		if (lnb[i].lnb_flags & OBD_BRW_ASYNC)
+			declare_flags |= OSD_QID_IGNORE_ROOT_PRJ;
 
 		if (size == 0) {
 			/* first valid lnb */
@@ -925,7 +930,7 @@ static int osd_declare_write_commit(const struct lu_env *env,
 
 	/* backend zfs FS might be configured to store multiple data copies */
 	space  *= osd->od_os->os_copies;
-	space   = toqb(space);
+	space   = stoqb(space);
 	CDEBUG(D_QUOTA, "writing %d pages, reserving %lldK of quota space\n",
 	       npages, space);
 
@@ -1017,15 +1022,12 @@ static void osd_choose_next_blocksize(struct osd_object *obj,
 	if (dn->dn_datablksz >= osd->od_max_blksz)
 		return;
 
-	/*
-	 * client sends data from own writeback cache after local
-	 * aggregation. there is a chance this is a "unit of write"
-	 * so blocksize.
-	 */
-	if (off != 0)
-		return;
+	if (off == obj->oo_attr.la_size)
+		blksz = (uint32_t)max_t(uint64_t, osd->od_min_blksz, off + len);
+	else
+		blksz = (uint32_t)max_t(uint64_t, osd->od_min_blksz, len);
+	blksz = (uint32_t)min_t(uint64_t, osd->od_max_blksz, blksz);
 
-	blksz = (uint32_t)min_t(uint64_t, osd->od_max_blksz, len);
 	if (!is_power_of_2(blksz))
 		blksz = size_roundup_power2(blksz);
 

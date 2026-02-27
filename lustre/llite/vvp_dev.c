@@ -21,7 +21,6 @@
 #include <obd.h>
 #include "llite_internal.h"
 #include "vvp_internal.h"
-#include <linux/kallsyms.h>
 
 /*
  * Vvp device and device type functions.
@@ -245,14 +244,6 @@ struct lu_device_type vvp_device_type = {
 	.ldt_ctx_tags = LCT_CL_THREAD
 };
 
-unsigned int (*vvp_account_page_dirtied)(struct page *page,
-					 struct address_space *mapping);
-#if !defined(FOLIO_MEMCG_LOCK_EXPORTED) && defined(HAVE_FOLIO_MEMCG_LOCK) && \
-     defined(HAVE_KALLSYMS_LOOKUP_NAME)
-void (*vvp_folio_memcg_lock)(struct folio *folio);
-void (*vvp_folio_memcg_unlock)(struct folio *folio);
-#endif
-
 /**
  * vvp_global_init() - init global resources required by the VVP layer
  *
@@ -273,33 +264,7 @@ int vvp_global_init(void)
 
 	rc = lu_device_type_init(&vvp_device_type);
 	if (rc != 0)
-		goto out_kmem;
-
-#ifndef HAVE_ACCOUNT_PAGE_DIRTIED_EXPORT
-#ifdef HAVE_KALLSYMS_LOOKUP_NAME
-	/*
-	 * Kernel v5.2-5678-gac1c3e4 no longer exports account_page_dirtied
-	 */
-	vvp_account_page_dirtied = (void *)
-		cfs_kallsyms_lookup_name("account_page_dirtied");
-#endif
-#endif
-
-#if !defined(FOLIO_MEMCG_LOCK_EXPORTED) && defined(HAVE_FOLIO_MEMCG_LOCK) && \
-     defined(HAVE_KALLSYMS_LOOKUP_NAME)
-	vvp_folio_memcg_lock = (void *)
-		cfs_kallsyms_lookup_name("folio_memcg_lock");
-	LASSERT(vvp_folio_memcg_lock);
-
-	vvp_folio_memcg_unlock = (void *)
-		cfs_kallsyms_lookup_name("folio_memcg_unlock");
-	LASSERT(vvp_folio_memcg_unlock);
-#endif
-
-	return 0;
-
-out_kmem:
-	lu_kmem_fini(vvp_caches);
+		lu_kmem_fini(vvp_caches);
 
 	return rc;
 }
@@ -437,7 +402,7 @@ static struct page *vvp_pgcache_current(struct vvp_seq_private *priv)
 						    priv->vsp_page_index,
 						    &vmpage);
 		if (nr > 0) {
-			priv->vsp_page_index = vmpage->index;
+			priv->vsp_page_index = folio_index_page(vmpage);
 			break;
 		}
 		cl_object_put(priv->vsp_env, priv->vsp_clob);
@@ -470,7 +435,7 @@ static void vvp_pgcache_page_show(const struct lu_env *env,
 		   PageWriteback(vmpage) ? "wb" : "-",
 		   vmpage,
 		   PFID(ll_inode2fid(vmpage->mapping->host)),
-		   vmpage->mapping->host, vmpage->index,
+		   vmpage->mapping->host, folio_index_page(vmpage),
 		   page_count(vmpage));
 	has_flags = 0;
 	seq_page_flag(seq, vmpage, locked, has_flags);
@@ -490,7 +455,7 @@ static int vvp_pgcache_show(struct seq_file *f, void *v)
 	struct page *vmpage = v;
 	struct cl_page *page;
 
-	seq_printf(f, "%8lx@" DFID ": ", vmpage->index,
+	seq_printf(f, "%8lx@" DFID ": ", folio_index_page(vmpage),
 		   PFID(lu_object_fid(&priv->vsp_clob->co_lu)));
 	lock_page(vmpage);
 	page = cl_vmpage_page(vmpage, priv->vsp_clob);

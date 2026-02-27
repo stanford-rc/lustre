@@ -6680,7 +6680,7 @@ test_73e() {
 		[[ -z $rinf ]] &&
 			error "Failed to determine interface for $rnode"
 		do_node $rnode "$LNETCTL lnet configure"
-		do_node $rnode "$LNETCTL net show"
+		do_node $rnode "$LNETCTL set discovery 0"
 
 		for ((n = 10; n <= 50; n++)); do
 			net=${NETTYPE}$n
@@ -6698,6 +6698,36 @@ test_73e() {
 	echo "Try to mount to MGS NID $mgs_nid"
 	$MOUNT_CMD $mgs_nid:/$FSNAME $MOUNT ||
 		error "Mount fails on $mgs_nid"
+	umount $MOUNT
+
+	# reload modules locally to clear all client states
+	unload_modules_local
+	local zkeeper=${KEEP_ZPOOL}
+	stack_trap "KEEP_ZPOOL=$zkeeper"
+	KEEP_ZPOOL="true"
+	if ! combined_mgs_mds ; then
+		stop_mgs || error "stop_mgs failed"
+	else
+		stop_mds || error "stop_mdt 1 failed"
+	fi
+	start_mgsmds
+
+	do_facet mgs $LNETCTL lnet configure
+	do_facet mgs $LNETCTL set discovery 0
+
+	load_modules_local
+	$LNETCTL lnet configure
+	$LNETCTL set discovery 0
+	$LNETCTL net add --net $net --if $inf
+	$LNETCTL net del --net ${NETTYPE}
+	$LNETCTL net show
+
+	echo "Try to mount after MGS remount"
+	$MOUNT_CMD $mgs_nid:/$FSNAME $MOUNT ||
+		error "Mount fails on $mgs_nid"
+	check_mount || error "check client $MOUNT failed"
+	$LFS df $MOUNT
+	check_lfs_df_ret_val $? || error "$LFS df $MOUNT failed"
 	umount $MOUNT
 }
 run_test 73e "Mount client with dynamic server NIDs"
@@ -12369,6 +12399,77 @@ test_161() {
 }
 run_test 161 "test '-o mgsname' option"
 
+test_162() {
+	(( MGS_VERSION >= $(version_code 2.17.50) )) ||
+		skip "Need MGS version at least 2.17.50"
+	local_mode && skip_env "skip in local mode"
+	local mhost
+
+	if ! combined_mgs_mds ; then
+		mhost=$(facet_active_host mgs)
+	else
+		mhost=$(facet_active_host mdt1)
+	fi
+
+	[[ ! $(local_node $mhost) ]]  ||
+		skip "Need client and MGS on different nodes"
+
+	setup
+	wait_clients_import_state ${CLIENTS:-$HOSTNAME} mds1 FULL
+
+	local OST1_NID=$(do_facet ost1 $LCTL list_nids | head -1)
+	local MDS_NID=$(do_facet $SINGLEMDS $LCTL list_nids | head -1)
+
+	#stop all devices on the same node
+	for ((num=1; num <= $MDSCOUNT; num++)); do
+		[[ "$mhost" != "$(facet_active_host mdt$num)" ]] ||
+			stop_mdt $num
+	done
+	[[ "$mhost" != "$(facet_active_host ost1)" ]] ||
+		stop_ost
+
+	if ! combined_mgs_mds ; then
+		stop_mgs
+		start_mgs "-o noclient"
+	else
+		start_mdt 1 "-o nosvc,noclient"
+	fi
+	stack_trap "do_facet mgs $LCTL dl" ERR
+
+	local FAKE_NIDS="192.168.0.112@tcp1,192.168.0.112@tcp2"
+	local FAKE_FAILOVER="192.168.0.113@tcp1,192.168.0.113@tcp2"
+	local NIDS_AND_FAILOVER="$MDS_NID,$FAKE_NIDS:$FAKE_FAILOVER"
+	echo "set NIDs with failover"
+	do_facet mgs $LCTL replace_nids $FSNAME-MDT0000 $NIDS_AND_FAILOVER ||
+		error "replace nids failed"
+
+	echo "replace MDS nid"
+	do_facet mgs $LCTL replace_nids $FSNAME-MDT0000 $MDS_NID ||
+		error "replace nids failed"
+
+	if ! combined_mgs_mds ; then
+		stop_mgs
+		start_mgs
+	else
+		stop_mdt 1
+	fi
+
+	#start all devices on the same node
+	for ((num=1; num <= $MDSCOUNT; num++)); do
+		[[ "$mhost" != "$(facet_active_host mdt$num)" ]] ||
+			start_mdt $num
+	done
+	[[ "$mhost" != "$(facet_active_host ost1)" ]] ||
+		start_ost
+
+	wait_clients_import_state ${CLIENTS:-$HOSTNAME} mds1 FULL
+
+	check_mount || error "error after nid replace"
+	cleanup || error "cleanup failed"
+	reformat_and_config
+}
+run_test 162 "replace nids with -o noclient"
+
 cleanup_200() {
 	local modopts=$1
 	stopall
@@ -12818,4 +12919,5 @@ reformat
 
 complete_test $SECONDS
 check_and_cleanup_lustre
+
 exit_status

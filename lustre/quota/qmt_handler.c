@@ -1138,6 +1138,9 @@ out_locked:
 	LQUOTA_DEBUG_LQES(env, "dqacq ends count:%llu ver:%llu rc:%d",
 		     repbody->qb_count, repbody->qb_slv_ver, rc);
 	qti_lqes_write_unlock(env);
+
+	repbody->qb_glb_ver = dt_version_get(env, LQE_GLB_OBJ(lqe));
+
 out:
 	qti_lqes_restore_fini(env);
 
@@ -1240,6 +1243,26 @@ static int qmt_dqacq(const struct lu_env *env, struct lu_device *ld,
 	if (repbody == NULL)
 		RETURN(err_serious(-EFAULT));
 
+	if (qbody->qb_id.qid_uid == 0 && qbody->qb_count == 0 &&
+	    qbody->qb_usage == 0 && qbody->qb_flags == QUOTA_DQACQ_FL_REPORT) {
+		struct qmt_pool_info *qpi;
+
+		rc = lquota_extract_fid(&qbody->qb_fid, &rtype, &qtype);
+		if (rc)
+			RETURN(-EINVAL);
+
+		qpi = qmt_pool_lookup_glb(env, qmt, rtype);
+		if (IS_ERR(qpi))
+			RETURN(PTR_ERR(qpi));
+
+		*repbody = *qbody;
+		repbody->qb_glb_ver = dt_version_get(env,
+						     qpi->qpi_glb_obj[qtype]);
+
+		qpi_putref(env, qpi);
+		RETURN(0);
+	}
+
 	/* verify if global lock is stale */
 	if (!lustre_handle_is_used(&qbody->qb_glb_lockh))
 		RETURN(-ENOLCK);
@@ -1322,6 +1345,100 @@ static int qmt_dqacq(const struct lu_env *env, struct lu_device *ld,
 	CDEBUG(D_QUOTA, "qmt_dqacq return qb_qunit %llu qb_count %llu\n",
 	       repbody->qb_qunit, repbody->qb_count);
 	qti_lqes_fini(env);
+	RETURN(rc);
+}
+
+static int lqa_parse_args(struct obd_device *obd, struct obd_ioctl_data *data,
+			  char **lqa, __u32 *start, __u32 *end)
+{
+	__u32 cmd = data->ioc_command;
+	int lqalen;
+
+	if (data->ioc_inlbuf1 && data->ioc_inllen1 &&
+	    data->ioc_inllen1 <= LQA_NAME_MAX + 1)
+		*lqa = data->ioc_inlbuf1;
+
+	if (!*lqa)
+		return cmd == LQA_LIST ? 0 : -EINVAL;
+
+	lqalen = strnlen(*lqa, LQA_NAME_MAX + 1);
+	if (!lqalen || lqalen == LQA_NAME_MAX + 1) {
+		CERROR("%s: lqa name is larger than maximum %d: rc = %d\n",
+		       obd->obd_name, LQA_NAME_MAX, -EINVAL);
+		return -EINVAL;
+	}
+
+	if (cmd == LQA_ADD || cmd == LQA_REM) {
+		*start = (__u32)data->ioc_u32_1;
+		*end = (__u32)data->ioc_u32_2;
+		if (*end < *start) {
+			CERROR("%s: lqa:%s range has end %d < start %d: rc = %d\n",
+			       obd->obd_name, *lqa, *end, *start, -EINVAL);
+			return -EINVAL;
+		} else {
+			CDEBUG(D_QUOTA, "lqa:%s [%u-%u]\n", *lqa, *start, *end);
+		}
+	}
+
+	return 0;
+}
+
+int qmt_iocontrol(unsigned int cmd, struct obd_export *exp, int len,
+		  void *karg, void __user *uarg)
+{
+	struct obd_device *obd = exp->exp_obd;
+	struct qmt_device *qmt = lu2qmt_dev(obd->obd_lu_dev);
+	struct obd_ioctl_data *data;
+	char *lqa = NULL;
+	__u32 start, end;
+	int rc = 0;
+
+	ENTRY;
+	CDEBUG(D_IOCTL, "%s: cmd=%x len=%u karg=%pK uarg=%pK\n",
+	       obd->obd_name, cmd, len, karg, uarg);
+	data = karg;
+
+	if (IS_ERR_OR_NULL(qmt)) {
+		rc = PTR_ERR_OR_ZERO(qmt) ?: -EFAULT;
+		CERROR("%s: qmt addr is unset: rc = %d\n", obd->obd_name, rc);
+		RETURN(rc);
+	}
+
+	/* qmt only supports LQA ioctls, for now */
+	if (cmd != OBD_IOC_LQACTL)
+		RETURN(-EINVAL);
+
+	start = end = 0;
+	rc = lqa_parse_args(obd, data, &lqa, &start, &end);
+	if (rc)
+		RETURN(rc);
+
+	switch (data->ioc_command) {
+	case LQA_NEW:
+		CDEBUG(D_QUOTA, "LQA_NEW lqa:%s\n", lqa);
+		rc = qmt_lqa_create(obd, qmt, lqa);
+		break;
+	case LQA_ADD:
+		CDEBUG(D_QUOTA, "LQA_ADD lqa:%s, [%u-%u]\n", lqa, start, end);
+		rc = qmt_lqa_add(qmt, lqa, start, end);
+		break;
+	case LQA_REM:
+		CDEBUG(D_QUOTA, "LQA_REM lqa:%s [%u-%u]\n", lqa, start, end);
+		rc = qmt_lqa_remove(qmt, lqa, start, end);
+		break;
+	case LQA_DEL:
+		CDEBUG(D_QUOTA, "LQA_DEL, lqa:%s\n", lqa);
+		rc = qmt_lqa_destroy(obd, qmt, lqa);
+		break;
+	case LQA_LIST:
+		CDEBUG(D_QUOTA, "LQA_LIST, lqa:%s\n", lqa);
+		rc = qmt_lqa_list(qmt, lqa, data);
+		break;
+	default:
+		rc = OBD_IOC_ERROR(obd->obd_name, data->ioc_command,
+				   "unrecognized", -ENOTTY);
+	}
+
 	RETURN(rc);
 }
 

@@ -33,10 +33,7 @@
 #ifdef HAVE_FILEATTR_GET
 #include <linux/fileattr.h>
 #endif
-#ifndef HAVE_CPUS_READ_LOCK
-#include <lustre_compat/linux/cpu.h>
-#endif
-#include <lustre_compat/linux/linux-misc.h>
+#include <linux/cpu.h>
 
 #include <uapi/linux/lustre/lustre_ioctl.h>
 #include <lustre_ioctl_old.h>
@@ -232,6 +229,9 @@ static struct ll_sb_info *ll_init_sbi(struct lustre_sb_info *lsi)
 	/* setstripe is allowed for all groups by default */
 	sbi->ll_enable_setstripe_gid = -1;
 
+	/* erasure coding is disabled by default */
+	sbi->ll_enable_erasure_coding = 0;
+
 	INIT_LIST_HEAD(&sbi->ll_all_quota_list);
 
 	rc = rhashtable_init(&sbi->ll_proj_sfs_htable, &proj_sfs_cache_params);
@@ -407,6 +407,9 @@ static int client_common_fill_super(struct super_block *sb, char *md, char *dt)
 				   OBD_CONNECT2_MIRROR_ID_FIX |
 				   OBD_CONNECT2_READDIR_OPEN;
 
+	if (llite_enable_flr_ec)
+		data->ocd_connect_flags2 |= OBD_CONNECT2_FLR_EC;
+
 #ifdef HAVE_LRU_RESIZE_SUPPORT
 	if (test_bit(LL_SBI_LRU_RESIZE, sbi->ll_flags))
 		data->ocd_connect_flags |= OBD_CONNECT_LRU_RESIZE;
@@ -547,6 +550,7 @@ retry_connect:
 	sb->s_magic = LL_SUPER_MAGIC;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sbi->ll_inode_cache_enabled = 1;
+	sbi->ll_dir_open_read = 0;
 	sbi->ll_namelen = min_t(u32, osfs->os_namelen, NAME_MAX);
 	sbi->ll_mnt.mnt = current->fs->root.mnt;
 	sbi->ll_mnt_ns = current->nsproxy->mnt_ns;
@@ -1711,12 +1715,6 @@ static struct inode *ll_iget_anon_dir(struct super_block *sb,
 		inode_set_atime(inode, 0, 0);
 		inode_set_ctime(inode, 0, 0);
 		inode->i_rdev = 0;
-
-#ifdef HAVE_BACKING_DEV_INFO
-		/* initializing backing dev info. */
-		inode->i_mapping->backing_dev_info =
-						&s2lsi(inode->i_sb)->lsi_bdi;
-#endif
 		inode->i_op = &ll_dir_inode_operations;
 		inode->i_fop = &ll_dir_operations;
 		lli->lli_fid = *fid;
@@ -2156,7 +2154,7 @@ static int ll_io_zero_page(struct inode *inode, pgoff_t index, pgoff_t offset,
 	page_locked = true;
 	if (!PageDirty(vmpage)) {
 		/* associate cl_page */
-		clpage = cl_page_find(env, clob, vmpage->index,
+		clpage = cl_page_find(env, clob, folio_index_page(vmpage),
 				      vmpage, CPT_CACHEABLE);
 		if (IS_ERR(clpage))
 			GOTO(pagefini, rc = PTR_ERR(clpage));
@@ -3230,11 +3228,6 @@ int ll_read_inode2(struct inode *inode, void *opaque)
 		RETURN(rc);
 
 	/* OIDEBUG(inode); */
-
-#ifdef HAVE_BACKING_DEV_INFO
-	/* initializing backing dev info. */
-	inode->i_mapping->backing_dev_info = &s2lsi(inode->i_sb)->lsi_bdi;
-#endif
 	if (S_ISREG(inode->i_mode)) {
 		struct ll_sb_info *sbi = ll_i2sbi(inode);
 
@@ -3604,38 +3597,6 @@ void ll_umount_begin(struct super_block *sb)
 	}
 
 	EXIT;
-}
-
-int ll_remount_fs(struct super_block *sb, int *flags, char *data)
-{
-	struct ll_sb_info *sbi = ll_s2sbi(sb);
-	char *profilenm = get_profile_name(sb);
-	int err;
-	__u32 read_only;
-
-	if ((*flags & MS_RDONLY) != (sb->s_flags & SB_RDONLY)) {
-		read_only = *flags & MS_RDONLY;
-		err = obd_set_info_async(NULL, sbi->ll_md_exp,
-					 sizeof(KEY_READ_ONLY),
-					 KEY_READ_ONLY, sizeof(read_only),
-					 &read_only, NULL);
-		if (err) {
-			LCONSOLE_WARN("Failed to remount %s %s (%d)\n",
-				      profilenm, read_only ?
-				      "read-only" : "read-write", err);
-			return err;
-		}
-
-		if (read_only)
-			sb->s_flags |= SB_RDONLY;
-		else
-			sb->s_flags &= ~SB_RDONLY;
-
-		if (test_bit(LL_SBI_VERBOSE, sbi->ll_flags))
-			LCONSOLE_WARN("Remounted %s %s\n", profilenm,
-				      read_only ?  "read-only" : "read-write");
-	}
-	return 0;
 }
 
 /**
@@ -4025,7 +3986,7 @@ struct md_op_data *ll_prep_md_op_data(struct md_op_data *op_data,
 		if (pfid && !fid_is_zero(pfid)) {
 			if (i2 == NULL)
 				op_data->op_fid2 = fid;
-			op_data->op_bias = MDS_FID_OP;
+			op_data->op_bias = MDS_FID_OP | MDS_NAMEHASH;
 		}
 		if (fname.disk_name.name &&
 		    fname.disk_name.name != (unsigned char *)name) {

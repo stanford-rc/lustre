@@ -1507,15 +1507,10 @@ int gss_svc_install_rctx_kr(struct obd_import *imp,
  ****************************************/
 
 static
-#ifdef HAVE_KEY_TYPE_INSTANTIATE_2ARGS
 int gss_kt_instantiate(struct key *key, struct key_preparsed_payload *prep)
 {
 	const void *data = prep->data;
 	size_t datalen = prep->datalen;
-#else
-int gss_kt_instantiate(struct key *key, const void *data, size_t datalen)
-{
-#endif
 	struct key *keyring;
 	int uid, rc;
 
@@ -1583,16 +1578,10 @@ int gss_kt_instantiate(struct key *key, const void *data, size_t datalen)
  * on the context without fear of loosing refcount.
  */
 static
-#ifdef HAVE_KEY_TYPE_INSTANTIATE_2ARGS
 int gss_kt_update(struct key *key, struct key_preparsed_payload *prep)
 {
 	const void *data = prep->data;
-	__u32 datalen32 = (__u32) prep->datalen;
-#else
-int gss_kt_update(struct key *key, const void *data, size_t datalen)
-{
-	__u32 datalen32 = (__u32) datalen;
-#endif
+	u32 datalen32 = (u32)prep->datalen;
 	struct ptlrpc_cli_ctx *ctx = key_get_payload(key, 0);
 	struct gss_cli_ctx *gctx;
 	rawobj_t tmpobj = RAWOBJ_EMPTY;
@@ -1715,14 +1704,6 @@ out:
 	RETURN(0);
 }
 
-#ifndef HAVE_KEY_MATCH_DATA
-static int
-gss_kt_match(const struct key *key, const void *desc)
-{
-	return strcmp(key->description, (const char *) desc) == 0 &&
-		!test_bit(KEY_FLAG_REVOKED, &key->flags);
-}
-#else /* ! HAVE_KEY_MATCH_DATA */
 static bool
 gss_kt_match(const struct key *key, const struct key_match_data *match_data)
 {
@@ -1741,7 +1722,6 @@ static int gss_kt_match_preparse(struct key_match_data *match_data)
 	match_data->cmp = gss_kt_match;
 	return 0;
 }
-#endif /* HAVE_KEY_MATCH_DATA */
 
 static
 void gss_kt_destroy(struct key *key)
@@ -1776,11 +1756,7 @@ static struct key_type gss_key_type =
 	.def_datalen	= 0,
 	.instantiate	= gss_kt_instantiate,
 	.update		= gss_kt_update,
-#ifdef HAVE_KEY_MATCH_DATA
 	.match_preparse = gss_kt_match_preparse,
-#else
-	.match		= gss_kt_match,
-#endif
 	.destroy	= gss_kt_destroy,
 	.describe	= gss_kt_describe,
 	.revoke		= gss_kt_revoke,

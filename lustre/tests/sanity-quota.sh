@@ -1463,6 +1463,59 @@ test_1j() {
 }
 run_test 1j "Enable project quota enforcement for root"
 
+test_1l() {
+	local tfile2=$MOUNT2/$tdir/$tfile.2
+	local tfile1=$DIR/$tdir/$tfile.1
+	local qdisk=30 # MB
+
+	is_project_quota_supported ||
+		skip "skip project quota unsupported"
+
+	mount_client $MOUNT2 || error "mount client2 failed"
+	stack_trap "umount_client $MOUNT2"
+	setup_quota_test || error "setup quota failed with $?"
+
+	$LFS setstripe -c 1 -i 0 $DIR/$tdir || error "setstripe failed"
+	set_ost_qtype $QTYPE || error "enable ost quota failed"
+	change_project -sp $TSTPRJID $DIR/$tdir ||
+		error "change_project failed"
+
+	# Enable root_prj_enable on MDT0 and OST0
+	local procf=osd-$mds1_FSTYPE.$FSNAME-MDT0000.quota_slave.root_prj_enable
+	do_facet mds1 $LCTL set_param $procf=1 ||
+		error "enable root quota for project failed on mds1"
+	stack_trap "do_facet mds1 $LCTL set_param $procf=0"
+
+	procf=osd-$ost1_FSTYPE.$FSNAME-OST0000.quota_slave.root_prj_enable
+	do_facet ost1 $LCTL set_param $procf=1 ||
+		error "enable root quota for project failed on ost1"
+	stack_trap "do_facet ost1 $LCTL set_param $procf=0"
+
+	# Set project quota limit
+	$LFS setquota -p $TSTPRJID -b 0 -B ${qdisk}M -i 0 -I 0 $DIR ||
+		error "set project quota failed"
+
+	# Fill quota from client 1 using direct IO to guarantee EDQUOT
+	$DD of=$tfile1 count=$((qdisk + 10)) oflag=direct &&
+		error "succeeded, expect EDQUOT"
+
+	# This write() should return success since pages go to cache
+	dd if=/dev/urandom of=$tfile2 bs=1M count=1 ||
+		skip "buffered write $tfile2 failed: $?"
+	local oldsum=($(md5sum $tfile2))
+
+	# Re-read file to verify data persisted
+	cancel_lru_locks osc
+	local newsum=($(md5sum $tfile2))
+	[[ "$newsum" == "$oldsum" ]] || {
+		echo "source file: $oldsum"
+		echo "copied file: $newsum"
+		cmp -bl $tfile1 $tfile2 | head -1024
+		error "old and new files differ"
+	}
+}
+run_test 1l "Async writes should not be rejected by quota with root_prj_enable"
+
 # test inode hardlimit
 test_2() {
 	local testfile="$DIR/$tdir/$tfile-0"
@@ -2551,6 +2604,47 @@ test_7e() {
 }
 run_test 7e "Quota reintegration (inode limits)"
 
+# quota reintegration automatically
+test_7f() {
+	(( $OST1_VERSION >= $(version_code 2.16.58) )) ||
+		skip "need OST >= 2.16.58 for quota reint timeout"
+
+	local blk_limit=1048576
+	local testfile="$DIR/$tdir/$tfile-0"
+
+	setup_quota_test || error "setup quota failed with $?"
+	set_ost_qtype $QTYPE || error "enable ost quota failed"
+
+	$LFS setquota -u $TSTID -b 0 -B $blk_limit $DIR ||
+		error "failed to set quota for $TSTUSR"
+
+	wait_quota_synced "ost1" "OST0000" "usr" $TSTID "hardlimit" "$blk_limit"
+
+	$LFS quota -v -u $TSTID $DIR
+
+	#define OBD_FAIL_QUOTA_DROP_VER_UPDATE  0xA11
+	do_facet ost1 $LCTL set_param fail_loc=0xa11
+
+	$LFS setquota -u $TSTID2 -b 0 -B $blk_limit $DIR ||
+		error "failed to set quota for $TSTUSR2"
+
+	sleep 5
+
+	value=$(get_quota_on_qsd ost1 OST0000 usr $TSTID2 hardlimit)
+	(( value == 0)) || error "hardlimit for $TSTID2 is not 0 ($value)"
+
+	# trigger quota request from OST1
+	$LFS setstripe $testfile -i 0 -c 1 || error "setstripe $testfile failed"
+	chown $TSTUSR.$TSTUSR $testfile || error "chown $testfile failed"
+
+	$RUNAS $DD of=$testfile count=$(( blk_limit / 1024 )) oflag=direct
+
+	value=$(get_quota_on_qsd ost1 OST0000 usr $TSTID2 hardlimit)
+	(( value == blk_limit)) ||
+		error "Quota for $TSTID2 is not synced ($value)"
+}
+run_test 7f "Quota reintegration automatically"
+
 # run dbench with quota enabled
 test_8() {
 	local BLK_LIMIT="100g" #100G
@@ -2698,7 +2792,7 @@ test_12a() {
 	[ "$OSTCOUNT" -lt "2" ] && skip "needs >= 2 OSTs"
 
 	local blimit=22 # MB
-	local blk_cnt=$((blimit - 5))
+	local blk_cnt=$((blimit - OSTCOUNT - 2))
 	local TESTFILE0="$DIR/$tdir/$tfile"-0
 	local TESTFILE1="$DIR/$tdir/$tfile"-1
 
@@ -4969,6 +5063,7 @@ test_default_quota() {
 	cancel_lru_locks osc
 	cancel_lru_locks mdc
 	sync; sync_all_data || true
+	wait_delete_completed || error "wait_delete_completed failed"
 	if [ $qres_type == "data" ]; then
 		$RUNAS $DD of=$TESTFILE count=$((LIMIT*2 >> 10)) oflag=sync ||
 			quota_error $qtype $qid "write failed, expect succeed"
@@ -6925,9 +7020,8 @@ test_90a()
 	(( MDS1_VERSION >= $(version_code 2.15.60) )) ||
 		skip "Need MDS version at least 2.15.60"
 
-	setup_quota_test || error "setup quota failed with $?"
-
-	stack_trap cleanup_quota_test
+	wait_delete_completed || error "wait_delete_completed failed"
+	sync_all_data
 
 	check_quota_no_mount
 	check_quota_no_mount -u $TSTUSR
@@ -6953,11 +7047,11 @@ test_90b()
 	(( MDS1_VERSION >= $(version_code 2.15.60) )) ||
 		skip "Need MDS version at least 2.15.60"
 
-	setup_quota_test || error "setup quota failed with $?"
-	mount_client $MOUNT2
+	wait_delete_completed || error "wait_delete_completed failed"
+	sync_all_data
 
+	mount_client $MOUNT2
 	stack_trap "umount $MOUNT2"
-	stack_trap cleanup_quota_test
 
 	check_quota_two_mounts -u $TSTUSR
 	check_quota_two_mounts "-a -u"
@@ -7383,17 +7477,20 @@ test_delete_big_file() {
 	local testdir=$DIR/$tdir
 	local tfile1=$DIR/$tdir/dd.out.0
 	local tfile2=$DIR/$tdir/dd.out.1
+	local limit=3 # GB
 
 	chown $TSTID:$TSTID $testdir || error "failed to chown $testdir"
 	$LFS project -sp $TSTPRJID $testdir ||
 		error "fail to set project on $testdir"
 
-	$LFS setquota -p $TSTPRJID -B 3G $DIR ||
+	$LFS setquota -p $TSTPRJID -B ${limit}G $DIR ||
 		error "failed to set quota limits for $TSTPRJID"
 	$LFS quota -p $TSTPRJID -h $DIR
 
 	$LFS setstripe $tfile1 -i 0 -c 1 || error "setstripe $tfile1 failed"
 	chown $TSTID:$TSTID $tfile1 || error "fail to chown $tfile1"
+	wait_quota_synced ost1 OST0000 prj $TSTPRJID hardlimit \
+		$((limit*1024*1024))
 
 	$RUNAS fallocate -l2GiB $tfile1 || error "fail to write 2GiB"
 	$RUNAS $DD of=$tfile1 seek=2048 count=1500 oflag=sync &&
@@ -7404,20 +7501,16 @@ test_delete_big_file() {
 	rm -f $tfile1
 	wait_delete_completed
 
-	sleep 15
-
 	$LFS quota -p $TSTPRJID -h $DIR
 	$LFS setstripe $tfile2 -i 1 -c 1 || error "setstripe $tfile2 failed"
 	chown $TSTID:$TSTID $tfile2 || error "fail to chown $tfile2"
+	wait_quota_synced ost2 OST0001 prj $TSTPRJID hardlimit \
+		$((limit*1024*1024))
 
 	$RUNAS fallocate -l2GiB $tfile2 || {
 		(( equot_expected == 0 )) && error "fail to write 2GiB"
 	}
 
-	(( equot_expected == 1 )) && {
-		$RUNAS $DD of=$tfile2 seek=2048 count=512 oflag=sync &&
-			error "write should fail after deleting big files"
-	}
 	(( equot_expected == 0 )) && {
 		$RUNAS $DD of=$tfile2 seek=2048 count=512 oflag=sync ||
 			error "write should succeed after deleting big files"
@@ -7452,16 +7545,136 @@ test_96() {
 	setup_quota_test || error "setup quota failed with $?"
 	set_ost_qtype $QTYPE || error "enable ost quota failed"
 
-	#define OBD_FAIL_QUOTA_USAGE_NOWAIT 0xA10
-	do_facet ost1 $LCTL set_param fail_loc=0xa10
-	do_facet ost2 $LCTL set_param fail_loc=0xa10
-	test_delete_big_file 1
-
 	do_facet ost1 $LCTL set_param fail_loc=0
 	do_facet ost2 $LCTL set_param fail_loc=0
 	test_delete_big_file 0
 }
 run_test 96 "quota grant should be released when big files are deleted"
+
+LQA_NEW="do_facet mds1 $LCTL lqa new --fsname $FSNAME"
+LQA_ADD="do_facet mds1 $LCTL lqa add --fsname $FSNAME"
+LQA_REMOVE="do_facet mds1 $LCTL lqa remove --fsname $FSNAME"
+LQA_DESTROY="do_facet mds1 $LCTL lqa destroy --fsname $FSNAME"
+LQA_LIST="do_facet mds1 $LCTL lqa list --fsname $FSNAME"
+
+test_97a()
+{
+	local lqa="lqa1"
+	local longstr="0123456789123456789"
+
+	(( $MDS1_VERSION >= $(version_code 2.17.50) )) ||
+		skip "need MDS >= 2.17.50 to support lctl lqa commands"
+
+	$LQA_NEW && error "lqa new succeeded with no lqa"
+#define LQA_NAME_MAX 15 /* Maximum lqa name length */
+	$LQA_NEW --name $longstr && error "lqa max name length is 16"
+	$LQA_NEW --name $lqa || error "cannot create $lqa"
+	stack_trap "$LQA_DESTROY --name $lqa || true"
+
+	$LQA_ADD && error "lqa add succeeded with no --name"
+	$LQA_ADD --name $lqa && error "lqa add succeeded wit no range"
+	$LQA_ADD --name $lqa --range -10 && error "lqa add wrong format 1"
+	$LQA_ADD --name $lqa --range 10-9 && error "lqa add wrong format 2"
+	$LQA_ADD --name $lqa --range 10--9 && error "lqa add wrong format 3"
+	$LQA_ADD --name $lqa --range 10 || error "lqa failed to add [10]"
+	$LQA_ADD --name $lqa --range 11-20 || error "lqa failed to add [10-20]"
+
+	$LQA_LIST || error "lqa list failed with no --name"
+	$LQA_LIST --name $lqa || error "lqa list failed to show $lqa ranges"
+
+	$LQA_REMOVE && error "lqa remove succeeded with no --name"
+	$LQA_REMOVE --name $lqa && error "lqa remove succeeded with no --range"
+	$LQA_REMOVE --name $lqa --range -10 && error "lqa remove wrong format 1"
+	$LQA_REMOVE --name $lqa --range 10-9 &&
+		error "lqa remove wrong format 2"
+	$LQA_REMOVE --name $lqa --range 10--9 &&
+		error "lqa remove wrong format 3"
+	$LQA_REMOVE --name $lqa --range 10 || error "lqa failed to remove 10"
+	$LQA_REMOVE --name $lqa --range 11-20 ||
+		error "lqa failed to remove 10-20"
+
+	$LQA_DESTROY && error "lqa destroy succeeded with no --name"
+	$LQA_DESTROY --name $lqa || error "cannot destroy $lqa"
+}
+run_test 97a "LQA control commands"
+
+test_97b()
+{
+	local lqa="lqa1"
+	local lqa2="lqa2"
+	local max_id=4294967295
+	local max_iter=50
+	local base=1000
+
+	(( $MDS1_VERSION >= $(version_code 2.17.50) )) ||
+		skip "need MDS >= 2.17.50 to support lctl lqa commands"
+
+	$LQA_NEW --name $lqa || error "cannot create $lqa"
+	stack_trap "$LQA_DESTROY --name $lqa"
+	$LQA_NEW --name $lqa && error "$lqa should already exist"
+	$LQA_NEW --name $lqa2 || error "cannot create $lqa2"
+	stack_trap "$LQA_DESTROY --name $lqa2"
+	$LQA_LIST | grep -q $lqa || error "lqa $lqa doesnt' exist"
+	$LQA_LIST | grep -q $lqa2 || error "lqa $lqa2 doesnt' exist"
+
+	# PQ could have the same name as LQA
+	pool_add $lqa || error "faled to create pool $lqa"
+	destroy_pool $lqa || error "failed to destroy pool $lqa"
+
+	$LQA_ADD --name $lqa --range 10-19 ||
+		error "cannot add range 10-19 to $lqa"
+	$LQA_LIST --name $lqa | grep -q "10-19" ||
+		error "range 10-19 doesn't exist in $lqa"
+	$LQA_ADD --name $lqa2 --range 10-19 ||
+		error "cannot add range 10-19 to $lqa2"
+	$LQA_LIST --name $lqa2 | grep -q "10-19" ||
+		error "range 10-20 doesn't exist in $lqa2"
+	$LQA_ADD --name $lqa --range 15-31 && error "ranges intersect in $lqa"
+	$LQA_ADD --name $lqa --range 20-29 ||
+		error "cannot add range 20-29 to $lqa"
+	$LQA_ADD --name $lqa --range 30 ||
+		error "cannot add range 30-30 to $lqa"
+	$LQA_REMOVE --name $lqa --range 10-19 ||
+		error "cannot remove range 10-19 from $lqa"
+	$LQA_REMOVE --name $lqa --range 10-19 &&
+		error "range 10-19 has been alread removed from $lqa"
+	$LQA_LIST --name $lqa || grep -q "20-29" ||
+		"range 20-29 doesn't exist in $lqa"
+	$LQA_REMOVE --name $lqa --range 20-29 ||
+		error "cannot remove range 20-29 from $lqa"
+	$LQA_LIST --name $lqa || grep -q "30-30" ||
+		"range 30-30 doesn't exist in $lqa"
+
+	$LQA_DESTROY --name $lqa || error "cannot destroy $lqa"
+	$LQA_DESTROY --name $lqa2 || error "cannot destroy $lqa2"
+	$LQA_NEW --name $lqa || error "cannot recreate $lqa"
+	$LQA_NEW --name $lqa2 || error "cannot recreate $lqa2"
+	$LQA_LIST --name $lqa | (($(wc -l) == 1)) ||
+		echo "$lqa is not empty after recreating"
+
+	[[ "$SLOW" = "yes" ]] && max_iter=500
+	local start=$SECONDS
+	do_facet mds1 "for ((i = 1; i <= $max_iter; i++)); do $LCTL lqa add \
+		       --fsname $FSNAME --name $lqa \
+		       --range \\\$(($max_id - i * $base)); done" ||
+		       error "cannot add $max_iter ranges in a cycle"
+	local end=$SECONDS
+	log "adding $max_iter LQA ranges took $((end - start))s"
+
+	local num=$($LQA_LIST --name $lqa | grep -oE '[0-9]+-[0-9]+' | wc -l)
+	echo "num $num"
+	((num == max_iter)) || error "$lqa ranges num $num != $max_iter"
+	$LQA_ADD --name $lqa --range $((max_id + 10)) &&
+		error "range id > UINT_MAX"
+	start=$SECONDS
+	do_facet mds1 "for i in {1..$max_iter}; do $LCTL lqa remove \
+		       --fsname $FSNAME --name $lqa \
+		       --range \\\$(($max_id - i * $base)); done" ||
+		       error "cannot remove $max_iter ranges in a cycle"
+	end=$SECONDS
+	log "Removing $max_iter LQA ranges took $((end - start))s"
+}
+run_test 97b "Check LQA internals"
 
 quota_fini()
 {

@@ -620,7 +620,7 @@ void ll_dom_finish_open(struct inode *inode, struct ptlrpc_request *req)
 			break;
 		}
 		/* attach VM page to CL page cache */
-		page = cl_page_find(env, obj, vmpage->index, vmpage,
+		page = cl_page_find(env, obj, folio_index_page(vmpage), vmpage,
 				    CPT_CACHEABLE);
 		if (IS_ERR(page)) {
 			ClearPageUptodate(vmpage);
@@ -641,18 +641,24 @@ out_io:
 
 	EXIT;
 }
+
 void ll_dir_finish_open(struct inode *inode, struct ptlrpc_request *req)
 {
 	struct obd_export *exp = ll_i2mdexp(inode);
-	void *data;
+	char *data;
+	struct page **page_pool;
 	struct page *page;
-	struct lu_dirpage *dp;
-	int is_hash64;
-	int rc;
-	unsigned long	offset;
-	__u64		hash;
 	unsigned int i;
+	unsigned int rep_size;
 	unsigned int npages;
+	unsigned int rd_pgs;
+	unsigned int lu_pgs;
+	int 		is_hash64;
+	struct lu_dirpage *dp;
+	int 		rc;
+	unsigned long   offset;
+	__u64		hash;
+	gfp_t gfp;
 
 	ENTRY;
 
@@ -667,38 +673,56 @@ void ll_dir_finish_open(struct inode *inode, struct ptlrpc_request *req)
 	if (data == NULL)
 		RETURN_EXIT;
 
-	npages = req_capsule_get_size(&req->rq_pill, &RMF_NIOBUF_INLINE,
-				      RCL_SERVER);
-	if (npages < sizeof(*dp))
+	rep_size = req_capsule_get_size(&req->rq_pill, &RMF_NIOBUF_INLINE,
+					RCL_SERVER);
+	if (rep_size < sizeof(struct lu_dirpage))
 		RETURN_EXIT;
 
-	/* div rou*/
-	npages = DIV_ROUND_UP(npages, PAGE_SIZE);
+	npages = (rep_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	lu_pgs = rep_size >> LU_PAGE_SHIFT;
+
 	is_hash64 = test_bit(LL_SBI_64BIT_HASH, ll_i2sbi(inode)->ll_flags);
+	gfp = mapping_gfp_mask(inode->i_mapping);
 
-	for (i = 0; i < npages; i++) {
-		page = __page_cache_alloc(mapping_gfp_mask(inode->i_mapping));
-		if (!page)
-			continue;
+	OBD_ALLOC_PTR_ARRAY(page_pool, npages);
+	if (page_pool == NULL)
+		RETURN_EXIT;
 
-		lock_page(page);
-		SetPageUptodate(page);
+	for (rd_pgs = 0; rd_pgs < npages; rd_pgs++) {
+		page = __page_cache_alloc(gfp);
+		if (page == NULL)
+			break;
+		page_pool[rd_pgs] = page;
 
 		dp = kmap_local_page(page);
+		CDEBUG(D_INFO, "page %p - %p - %p -> %llu %llu\n", page, dp, data, dp->ldp_hash_start, dp->ldp_hash_end);
 		memcpy(dp, data, PAGE_SIZE);
-		hash = le64_to_cpu(dp->ldp_hash_start);
 		kunmap_local(dp);
 
-		offset = hash_x_index(hash, is_hash64);
-
-		prefetchw(&page->flags);
-		rc = add_to_page_cache_lru(page, inode->i_mapping, offset,
-				   GFP_KERNEL);
-		if (rc == 0)
-			unlock_page(page);
-
-		put_page(page);
+		data += PAGE_SIZE;
 	}
+	if (rd_pgs == 0)
+		goto exit;
+
+	page = page_pool[0];
+	dp = kmap_local_page(page);
+	hash = le64_to_cpu(dp->ldp_hash_start);
+	kunmap_local(dp);
+
+	offset = hash_x_index(hash, is_hash64);
+
+	prefetchw(&page->flags);
+	rc = add_to_page_cache_lru(page, inode->i_mapping, offset, GFP_KERNEL);
+	if (rc == 0)
+		md_dirpage_add(exp, inode, page_pool, rd_pgs, lu_pgs, is_hash64);
+exit:
+	if (rc < 0) {
+		/* release extra pages */
+		for (i = 0; i < rd_pgs; i++)
+			put_page(page_pool[i]);
+	}
+	OBD_FREE_PTR_ARRAY(page_pool, npages);
+
 	EXIT;
 }
 
@@ -1898,7 +1922,8 @@ static void ll_heat_add(struct inode *inode, enum cl_io_type iot,
 
 static bool
 ll_hybrid_bio_dio_switch_check(struct file *file, struct kiocb *iocb,
-			       enum cl_io_type iot, size_t count)
+			       struct iov_iter *iter, enum cl_io_type iot,
+			       size_t count)
 {
 	/* we can only do this with IOCB_FLAGS, since we can't modify f_flags
 	 * because they're visible in userspace.  so we check for IOCB_DIRECT
@@ -1922,6 +1947,13 @@ ll_hybrid_bio_dio_switch_check(struct file *file, struct kiocb *iocb,
 		RETURN(false);
 
 	if (!test_bit(LL_SBI_HYBRID_IO, sbi->ll_flags))
+		RETURN(false);
+
+	/* Pipe iterators cannot work with DIO - iov_iter_get_pages_alloc2()
+	 * will fail or return 0 for pipes, so don't switch to DIO for pipe
+	 * iterators.
+	 */
+	if (iov_iter_is_pipe(iter))
 		RETURN(false);
 
 	/*
@@ -2377,14 +2409,6 @@ fini_io:
 	RETURN(rc);
 }
 
-#ifdef HAVE_IOV_ITER_INIT_DIRECTION
-# define ll_iov_iter_init(i, d, v, n, l) \
-	 iov_iter_init((i), (d), (v), (n), (l))
-# else
-# define ll_iov_iter_init(i, d, v, n, l) \
-	 iov_iter_init((i), (v), (n), (l), 0)
-# endif
-
 typedef ssize_t (*iter_fn_t)(struct kiocb *, struct iov_iter *);
 
 static ssize_t do_loop_readv_writev(struct kiocb *iocb, const struct iovec *iov,
@@ -2398,7 +2422,7 @@ static ssize_t do_loop_readv_writev(struct kiocb *iocb, const struct iovec *iov,
 		ssize_t nr;
 		size_t len = vector->iov_len;
 
-		ll_iov_iter_init(&i, rw, vector, 1, len);
+		iov_iter_init(&i, rw, vector, 1, len);
 		nr = fn(iocb, &i);
 		if (nr < 0) {
 			if (!ret)
@@ -2436,7 +2460,7 @@ static bool is_unaligned_directio(struct kiocb *iocb, struct iov_iter *iter,
 
 /* This I/O could be switched to direct i/o if the kernel is new enough */
 #ifdef IOCB_DIRECT
-	if (ll_hybrid_bio_dio_switch_check(file, iocb, io_type,
+	if (ll_hybrid_bio_dio_switch_check(file, iocb, iter, io_type,
 					   iov_iter_count(iter)))
 		direct_io = true;
 #endif
@@ -2509,7 +2533,7 @@ static ssize_t do_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	args->u.normal.via_iter = to;
 	args->u.normal.via_iocb = iocb;
 
-	if (ll_hybrid_bio_dio_switch_check(file, iocb, CIT_READ,
+	if (ll_hybrid_bio_dio_switch_check(file, iocb, to, CIT_READ,
 					   iov_iter_count(to)) ||
 	    CFS_FAIL_CHECK(OBD_FAIL_LLITE_FORCE_BIO_AS_DIO)) {
 #ifdef IOCB_DIRECT
@@ -2664,7 +2688,7 @@ static ssize_t do_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (cached && result != -ENOSPC && result != -EDQUOT)
 		GOTO(out, rc_normal = result);
 
-	if (ll_hybrid_bio_dio_switch_check(file, iocb, CIT_WRITE,
+	if (ll_hybrid_bio_dio_switch_check(file, iocb, from, CIT_WRITE,
 					   iov_iter_count(from)) ||
 	    CFS_FAIL_CHECK(OBD_FAIL_LLITE_FORCE_BIO_AS_DIO)) {
 #ifdef IOCB_DIRECT
@@ -2746,14 +2770,32 @@ int ll_lov_setstripe_ea_info(struct inode *inode, struct dentry *dentry,
 		.it_op = IT_OPEN,
 		.it_open_flags = flags | MDS_OPEN_BY_FID,
 	};
+	struct ll_sb_info *sbi = ll_i2sbi(inode);
 	int rc;
 
 	ENTRY;
+	/* Check for EC layouts when erasure coding is disabled */
+	if (lum->lmm_magic == LOV_USER_MAGIC_COMP_V1 &&
+	    !sbi->ll_enable_erasure_coding) {
+		struct lov_comp_md_v1 *comp_v1 = (struct lov_comp_md_v1 *)lum;
+		int i;
+
+		for (i = 0; i < comp_v1->lcm_entry_count; i++) {
+			if (comp_v1->lcm_entries[i].lcme_flags &
+			    LCME_FL_PARITY) {
+				CDEBUG(D_LAYOUT,
+				       "Rejecting EC layout: erasure coding disabled\n");
+				RETURN(-EOPNOTSUPP);
+			}
+		}
+	}
+
 	if ((__swab32(lum->lmm_magic) & le32_to_cpu(LOV_MAGIC_MASK)) ==
 	    le32_to_cpu(LOV_MAGIC_MAGIC)) {
 		/* this code will only exist for big-endian systems */
 		lustre_swab_lov_user_md(lum, 0);
 	}
+	/* from here, the layout in lum is in Little Endian */
 
 	ll_inode_size_lock(inode);
 	rc = ll_intent_file_open(dentry, lum, lum_size, &oit);
@@ -3372,7 +3414,7 @@ lookup:
 			continue;
 
 		inode_lock(parent);
-		de = lookup_one_len(p, de_parent, len);
+		de = lookup_noperm(&QSTR_LEN(p, len), de_parent);
 		inode_unlock(parent);
 		if (IS_ERR_OR_NULL(de) || !de->d_inode) {
 			dput(de_parent);
@@ -4296,9 +4338,10 @@ int ll_ioctl_project(struct file *file, unsigned int cmd, void __user *uarg)
 	/* apply child dentry if name is valid */
 	name_len = strnlen(lu_project.project_name, NAME_MAX);
 	if (name_len > 0 && name_len <= NAME_MAX) {
+		struct qstr qstr = QSTR_INIT(lu_project.project_name, name_len);
+
 		inode_lock(inode);
-		child_dentry = lookup_one_len(lu_project.project_name,
-					      dentry, name_len);
+		child_dentry = lookup_noperm(&qstr, dentry);
 		inode_unlock(inode);
 		if (IS_ERR(child_dentry)) {
 			rc = PTR_ERR(child_dentry);
@@ -5510,11 +5553,7 @@ static void ll_file_flock_async_cb(struct ldlm_flock_info *args)
 
 		wait_event_idle(args->fa_waitq, args->fa_ready);
 
-#ifdef HAVE_LM_GRANT_2ARGS
 		rc = args->fa_notify(&notify_lock, err);
-#else
-		rc = args->fa_notify(&notify_lock, NULL, err);
-#endif
 		if (rc) {
 			CDEBUG_LIMIT(D_ERROR,
 				     "notify failed file_lock=%p err=%d\n",
@@ -6742,9 +6781,7 @@ const struct inode_operations ll_file_inode_operations = {
 	.get_inode_acl	= ll_get_inode_acl,
 #endif
 	.get_acl	= ll_get_acl,
-#ifdef HAVE_IOP_SET_ACL
 	.set_acl	= ll_set_acl,
-#endif
 #ifdef HAVE_FILEATTR_GET
 	.fileattr_get	= ll_fileattr_get,
 	.fileattr_set	= ll_fileattr_set,

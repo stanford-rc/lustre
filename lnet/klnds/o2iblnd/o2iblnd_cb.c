@@ -352,7 +352,7 @@ kiblnd_handle_rx(struct kib_rx *rx)
 	switch (msg->ibm_type) {
 	default:
 		rc = -EPROTO;
-                CERROR("Bad IBLND message type %x from %s: rc = %d\n",
+		CERROR("Bad IBLND message type %x from %s: rc = %d\n",
 		       msg->ibm_type, libcfs_nidstr(&conn->ibc_peer->ibp_nid),
 		       rc);
 		post_credit = IBLND_POSTRX_NO_CREDIT;
@@ -3495,6 +3495,13 @@ kiblnd_cm_callback(struct rdma_cm_id *cmid, struct rdma_cm_event *event)
 
 	case RDMA_CM_EVENT_ADDR_CHANGE:
 		LCONSOLE_INFO("Physical link changed (eg hca/port)\n");
+		return 0;
+
+	case RDMA_CM_EVENT_CONNECT_RESPONSE:
+		conn = cmid->context;
+		LCONSOLE_INFO("RDMA_CM_EVENT_CONNECT_RESPONSE from %s, with status %d, ibc_state %d\n",
+			      libcfs_nidstr(&conn->ibc_peer->ibp_nid),
+			      event->status, conn->ibc_state);
 		return 0;
 	}
 }

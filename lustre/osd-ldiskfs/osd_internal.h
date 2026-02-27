@@ -748,11 +748,7 @@ struct osd_thread_info {
 
 	/* used by quota code */
 	union {
-#if defined(HAVE_DQUOT_QC_DQBLK)
 		struct qc_dqblk		oti_qdq;
-#else
-		struct fs_disk_quota    oti_fdq;
-#endif
 		struct if_dqinfo	oti_dqinfo;
 	};
 	struct lquota_id_info	oti_qi;
@@ -1011,11 +1007,11 @@ bool osd_scrub_oi_resurrect(struct lustre_scrub *scrub,
 			    const struct lu_fid *fid);
 void osd_scrub_dump(struct seq_file *m, struct osd_device *dev);
 
-struct dentry *osd_lookup_one_len_unlocked(struct osd_device *dev,
-					   const char *name,
-					   struct dentry *base, int len);
-struct dentry *osd_lookup_one_len(struct osd_device *dev, const char *name,
-				  struct dentry *base, int len);
+struct dentry *osd_lookup_noperm_unlocked(struct osd_device *dev,
+					  struct qstr *qstr,
+					  struct dentry *base);
+struct dentry *osd_lookup_noperm(struct osd_device *dev, struct qstr *qstr,
+				 struct dentry *base);
 
 int osd_fld_lookup(const struct lu_env *env, struct osd_device *osd,
 		   u64 seq, struct lu_seq_range *range);
@@ -1745,9 +1741,7 @@ void osd_execute_truncate(struct osd_object *obj);
 
 struct osd_bio_private {
 	struct work_struct	obp_work;
-#ifdef HAVE_BIP_ITER_BIO_INTEGRITY_PAYLOAD
 	struct bvec_iter	obp_integrity_iter;
-#endif
 	struct bio		*obp_bio;
 	struct osd_iobuf	*obp_iobuf;
 	void			*obp_integrity_buf;
@@ -1799,11 +1793,7 @@ static inline const char *blk_integrity_name(struct blk_integrity *bi)
 
 static inline unsigned int bip_size(struct bio_integrity_payload *bip)
 {
-#ifdef HAVE_BIP_ITER_BIO_INTEGRITY_PAYLOAD
 	return bip->bip_iter.bi_size;
-#else
-	return bip->bip_size;
-#endif
 }
 #else /* !CONFIG_BLK_DEV_INTEGRITY */
 static inline unsigned short blk_integrity_interval(struct blk_integrity *bi)
@@ -1888,19 +1878,17 @@ bool osd_tx_was_declared(const struct lu_env *env, struct osd_thandle *oth,
 #ifdef HAVE_FILLDIR_USE_CTX_RETURN_BOOL
 #define WRAP_FILLDIR_FN(prefix, fill_fn) \
 static bool fill_fn(struct dir_context *buf, const char *name, int namelen, \
-		    loff_t offset, __u64 ino, unsigned int d_type)	    \
+		    loff_t offset, u64 ino, unsigned int d_type)	    \
 {									    \
 	return !prefix##fill_fn(buf, name, namelen, offset, ino, d_type);   \
 }
-#elif defined(HAVE_FILLDIR_USE_CTX)
+#else
 #define WRAP_FILLDIR_FN(prefix, fill_fn) \
 static int fill_fn(struct dir_context *buf, const char *name, int namelen,  \
-		   loff_t offset, __u64 ino, unsigned int d_type)	    \
+		   loff_t offset, u64 ino, unsigned int d_type)		    \
 {									    \
 	return prefix##fill_fn(buf, name, namelen, offset, ino, d_type);    \
 }
-#else
-#define WRAP_FILLDIR_FN(prefix, fill_fn)
 #endif
 
 #define LDISKFS_OSD_USER_MODIFIABLE	LUSTRE_FL_USER_MODIFIABLE

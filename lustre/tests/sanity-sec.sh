@@ -1400,7 +1400,7 @@ fileset_test_cleanup() {
 
 	# flush MDT locks to make sure they are reacquired before test
 	do_node ${clients_arr[0]} $LCTL set_param \
-		ldlm.namespaces.$FSNAME-MDT*.lru_size=clear
+		ldlm.namespaces.$FSNAME-MDT*.lru_size=clear || true
 
 	wait_nm_sync $nm trusted_nodemap
 	if [ -n "$FILESET" -a -z "$SKIP_FILESET" ]; then
@@ -1679,6 +1679,7 @@ nodemap_test_setup() {
 		--property admin --value 1
 	do_facet mgs $LCTL nodemap_modify --name default \
 		--property trusted --value 1
+	wait_nm_sync default trusted_nodemap
 
 	do_facet mgs $LCTL nodemap_activate $active_nodemap
 	wait_nm_sync active
@@ -1694,6 +1695,7 @@ nodemap_test_cleanup() {
 		 --property admin --value 0
 	do_facet mgs $LCTL nodemap_modify --name default \
 		 --property trusted --value 0
+	wait_nm_sync default trusted_nodemap
 
 	do_facet mgs $LCTL nodemap_activate 0
 	wait_nm_sync active 0
@@ -2163,6 +2165,9 @@ test_25b() {
 
 	(( $MGS_VERSION >= $(version_code 2.16.52) )) ||
 		skip "Need MGS >= 2.16.52 for updated nodemap_info"
+
+	# in local mode the exports order on the nodemap cannot be compared
+	local_mode && skip "test does not support local mode"
 
 	nodemap_test_setup
 	stack_trap nodemap_test_cleanup EXIT
@@ -4574,7 +4579,7 @@ insert_enc_key() {
 remove_enc_key() {
 	local dummy_key
 
-	$LCTL set_param -n ldlm.namespaces.*.lru_size=clear
+	$LCTL set_param -n ldlm.namespaces.*.lru_size=clear || true
 	sync ; echo 3 > /proc/sys/vm/drop_caches
 	dummy_key=$(keyctl show | awk '$7 ~ "^fscrypt:" {print $1}')
 	if [ -n "$dummy_key" ]; then
@@ -4584,6 +4589,8 @@ remove_enc_key() {
 }
 
 remount_client_normally() {
+	local ldlmcount=$((MDSCOUNT+OSTCOUNT))
+
 	# remount client without dummy encryption key
 	if is_mounted $MOUNT; then
 		umount_client $MOUNT || error "umount $MOUNT failed"
@@ -4597,7 +4604,16 @@ remount_client_normally() {
 	if [ "$MOUNT_2" ]; then
 		mount_client $MOUNT2 ${MOUNT_OPTS} ||
 			error "remount failed"
+		ldlmcount=$((ldlmcount*2))
 	fi
+
+	# add 1 for the MGS connection
+	((ldlmcount++))
+
+	wait_update_facet --verbose client \
+		"$LCTL get_param -n ldlm.namespaces.*.lru_size | wc -l" \
+		$ldlmcount 120 ||
+			error "leftover ldlms"
 
 	remove_enc_key
 	wait_ssk
@@ -4754,6 +4770,8 @@ test_38() {
 	local filesz
 	local bsize
 	local pagesz=$(getconf PAGE_SIZE)
+
+	[[ $(facet_fstype ost1) == zfs ]] && skip "skip ZFS backend"
 
 	$LCTL get_param mdc.*.import | grep -q client_encryption ||
 		skip "client encryption not supported"
@@ -6520,6 +6538,7 @@ setup_local_client_nodemap() {
 	fi
 
 	do_facet mgs $LCTL nodemap_del $nm_name || true
+	wait_nm_sync $nm_name id ''
 
 	do_facet mgs $LCTL nodemap_modify --name default \
 		--property admin --value 1
@@ -7968,6 +7987,194 @@ test_64h() {
 }
 run_test 64h "Nodemap enforces local_admin RBAC roles"
 
+test_64i() {
+	local tf=$DIR/$tdir/$tfile
+	local offset_start=100000
+	local offset_limit=100000
+	local quota_limit=10 # MB
+	local dom_size=20971520 # 20MB
+	local rbac
+	local stat
+
+	(( OST1_VERSION >= $(version_code 2.17.50) )) ||
+		skip "Need OST >= 2.17.50 for this test"
+	(( MDS1_VERSION >= $(version_code 2.17.50) )) ||
+		skip "Need MDS >= 2.17.50 for this test"
+
+	do_nodes $(all_mdts_nodes) \
+		$LCTL set_param mdt.*.identity_upcall=NONE
+
+	# Increase dom_stripesize to easier exceed quota_limit for DOM files
+	local dom_saved=$(do_facet mds1 $LCTL get_param -n \
+				  lod.*-MDT0000-mdtlov.dom_stripesize)
+	do_nodes $(all_mdts_nodes) $LCTL set_param -n \
+		lod.*-MDT*-mdtlov.dom_stripesize=$dom_size ||
+		error "set dom_stripesize failed"
+	stack_trap "do_nodes $(all_mdts_nodes) $LCTL set_param -n \
+		lod.*-MDT*-mdtlov.dom_stripesize=$dom_saved"
+
+	stack_trap "$LFS setquota -u $offset_start --delete $MOUNT"
+	stack_trap cleanup_local_client_nodemap_with_mounts
+	mkdir -p ${DIR}/$tdir || error "mkdir ${DIR}/$tdir failed"
+	chown $offset_start ${DIR}/$tdir
+	setup_local_client_nodemap "c0" 1 1
+
+	# Enable quota enforcement for both OST and MDT including block
+	# quota on MDT for DOM files (see quota_slave_dt)
+	stack_trap "set_ost_qtype none"
+	set_ost_qtype "u" || error "enable ost quota failed"
+	stack_trap "set_mdt_qtype none"
+	set_mdt_qtype "u" || error "enable mdt quota failed"
+	do_nodes $(all_mdts_nodes) $LCTL set_param \
+		osd-*.*-MDT*.quota_slave_dt.enabled=u ||
+		error "enable mdt block quota failed"
+	stack_trap "do_nodes $(all_mdts_nodes) $LCTL set_param \
+		osd-*.*-MDT*.quota_slave_dt.enabled=none"
+
+	# Set quota limit on the mapped root UID (offset_start)
+	$LFS setquota -u $offset_start -b 0 -B ${quota_limit}M \
+		-i 0 -I 0 $MOUNT || error "set quota failed"
+
+	echo "Current MOUNT:"
+	ls -al $MOUNT
+
+	do_facet mgs $LCTL nodemap_add_offset --name c0 \
+		--offset $offset_start --limit $offset_limit ||
+		error "cannot set offset for c0"
+	wait_nm_sync c0 offset
+
+	echo "Current MOUNT:"
+	ls -al $MOUNT
+
+	echo "Test 1: admin_nodemap=1, local_admin in RBAC, trusted=1"
+	echo "  Expected: root can bypass quota (write succeeds)"
+	rbac="file_perms,quota_ops,local_admin,server_upcall"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property rbac \
+		--value $rbac || error "setting rbac $rbac failed"
+	wait_nm_sync c0 rbac
+
+	# Write should succeed (bypass quota)
+	$DD of=$tf bs=1M count=$((quota_limit + 5)) oflag=direct ||
+		error "write failed, expected success (local_admin)"
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 2: admin_nodemap=1, local_admin NOT in RBAC, trusted=1"
+	echo "  Expected: root must respect quota (write fails with EDQUOT)"
+	rbac="file_perms,quota_ops,server_upcall"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property rbac \
+		--value $rbac || error "setting rbac $rbac failed"
+	wait_nm_sync c0 rbac
+
+	# Write should fail (quota enforced)
+	stat=$(LOCALE=C $DD of=$tf bs=1M \
+		count=$((quota_limit + 5)) oflag=direct 2>&1)
+	echo "dd output: $stat"
+	echo "$stat" | grep -q "Disk quota exceeded" ||
+		error "expected 'Disk quota exceeded' but got: $stat"
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 3: admin_nodemap=1, local_admin NOT in RBAC, trusted=0"
+	echo "  Expected: root must respect quota (write fails with EDQUOT)"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property trusted \
+		--value 0 || error "setting trusted=0 failed"
+	wait_nm_sync c0 trusted_nodemap
+
+	# Write should fail (quota enforced, trusted doesn't affect this)
+	stat=$(LOCALE=C $DD of=$tf bs=1M \
+		count=$((quota_limit + 5)) oflag=direct 2>&1)
+	echo "dd output: $stat"
+	echo "$stat" | grep -q "Disk quota exceeded" ||
+		error "expected 'Disk quota exceeded' but got: $stat"
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 4: admin_nodemap=1, local_admin in RBAC, trusted=0"
+	echo "  Expected: root can bypass quota (write succeeds)"
+	rbac="file_perms,quota_ops,local_admin,server_upcall"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property rbac \
+		--value $rbac || error "setting rbac $rbac failed"
+	wait_nm_sync c0 rbac
+
+	# Write should succeed (bypass quota, trusted doesn't affect this)
+	$DD of=$tf bs=1M count=$((quota_limit + 5)) oflag=direct ||
+		error "write failed, expected success (local_admin)"
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 5: admin_nodemap=0, local_admin in RBAC"
+	echo "  Expected: root is squashed, permission denied"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property admin \
+		--value 0 || error "setting admin=0 failed"
+	wait_nm_sync c0 admin_nodemap
+
+	echo "Current MOUNT:"
+	ls -al $MOUNT
+
+	# Write should fail (root is squashed, quota enforced)
+	stat=$(LOCALE=C $DD of=$tf bs=1M \
+		count=$((quota_limit + 5)) oflag=direct 2>&1)
+	echo "dd output: $stat"
+	echo "$stat" | grep -q "Permission denied" ||
+		error "expected 'Permission denied' but got: $stat"
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 6: admin_nodemap=0, local_admin NOT in RBAC"
+	echo "  Expected: root is squashed, permission denied"
+	rbac="file_perms,quota_ops,server_upcall"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property rbac \
+		--value $rbac || error "setting rbac $rbac failed"
+	wait_nm_sync c0 rbac
+
+	# Write should fail (root is squashed, quota enforced)
+	stat=$(LOCALE=C $DD of=$tf bs=1M \
+		count=$((quota_limit + 5)) oflag=direct 2>&1)
+	echo "dd output: $stat"
+	echo "$stat" | grep -q "Permission denied" ||
+		error "expected 'Permission denied' but got: $stat"
+
+	# Restore admin=1, trusted=1 for DOM tests
+	do_facet mgs $LCTL nodemap_modify --name c0 --property admin \
+		--value 1 || error "setting admin=1 failed"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property trusted \
+		--value 1 || error "setting trusted=1 failed"
+	wait_nm_sync c0 trusted_nodemap
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 7: admin=1, trusted=1, local_admin in RBAC (DOM only)"
+	echo "  Expected: root can bypass quota (DOM write succeeds)"
+	rbac="file_perms,quota_ops,local_admin,server_upcall"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property rbac \
+		--value $rbac || error "setting rbac $rbac failed"
+	wait_nm_sync c0 rbac
+
+	$LFS setstripe -E $dom_size -L mdt $tf ||
+		error "setstripe DOM failed"
+	$DD of=$tf bs=1M count=$((quota_limit + 5)) oflag=sync ||
+		error "DOM write failed, expected success (local_admin)"
+	rm -f $tf
+	wait_delete_completed || error "wait_delete_completed failed"
+
+	echo "Test 8: admin=1, trusted=1, local_admin NOT in RBAC (DOM only)"
+	echo "  Expected: root must respect quota (DOM write fails EDQUOT)"
+	rbac="file_perms,quota_ops,server_upcall"
+	do_facet mgs $LCTL nodemap_modify --name c0 --property rbac \
+		--value $rbac || error "setting rbac $rbac failed"
+	wait_nm_sync c0 rbac
+
+	$LFS setstripe -E $dom_size -L mdt $tf ||
+		error "setstripe DOM failed"
+	stat=$(LOCALE=C $DD of=$tf bs=1M \
+		count=$((quota_limit + 5)) oflag=sync 2>&1)
+	echo "dd DOM output: $stat"
+	echo "$stat" | grep -q "Disk quota exceeded" ||
+		error "expected DOM 'Disk quota exceeded' but got: $stat"
+}
+run_test 64i "Nodemap quota enforcement with local_admin RBAC and offsets"
+
 look_for_files() {
 	local pattern=$1
 	local neg=$2
@@ -8703,18 +8910,17 @@ test_72d() {
 	local nm=nm_test72d
 	local nm2=subnm_test72d
 	local val
-	local same_server_node=false
+	local delete_dyn_nm=false
 
 	is_multi_fileset_supported "ost1" ||
 		skip "Need OSS >= 2.16.57 for multiple filesets"
 
 	# When MGS and OST are colocated, we need to explicitly remove the
-	# dynamic nodemap.
-	# FIXME we should be able to rely on the nodemap synchronization wiping
-	# all dynamic nodemaps even if the MGS and OST are colocated. In this
-	# case, "same_server_node" should be removed and not separately handled.
+	# dynamic nodemap on earlier versions (LU-19478) because nodemap
+	# synchronization does not explicitly wipe them.
 	[[ "$(facet_active_host mgs)" == "$(facet_active_host ost1)" ]] &&
-		same_server_node=true
+		(( OST1_VERSION < $(version_code 2.16.61) )) &&
+		delete_dyn_nm=true
 
 	stack_trap "cleanup_72d $mgsnm $nm $nm2" EXIT
 
@@ -8757,7 +8963,7 @@ test_72d() {
 		error "modify fileset for $mgsnm on MGS failed"
 	wait_nm_sync $mgsnm fileset '' inactive
 
-	if $same_server_node; then
+	if $delete_dyn_nm; then
 		do_facet ost1 $LCTL nodemap_del $nm
 	fi
 
@@ -8984,19 +9190,18 @@ test_72f() {
 	local fileset_prim="/primary"
 	local fileset_alt1="/alt1"
 	local fileset_alt2="/alt2"
-	local same_server_node=false
+	local delete_dyn_nm=false
 	local val
 
 	is_multi_fileset_supported "ost1" ||
 		skip "Need OSS >= 2.16.57 for multiple filesets"
 
 	# When MGS and OST are colocated, we need to explicitly remove the
-	# dynamic nodemap.
-	# FIXME we should be able to rely on the nodemap synchronization wiping
-	# all dynamic nodemaps even if the MGS and OST are colocated. In this
-	# case, "same_server_node" should be removed and not separately handled.
+	# dynamic nodemap on earlier versions (LU-19478) because nodemap
+	# synchronization does not explicitly wipe them.
 	[[ "$(facet_active_host mgs)" == "$(facet_active_host ost1)" ]] &&
-		same_server_node=true
+		(( OST1_VERSION < $(version_code 2.16.61) )) &&
+		delete_dyn_nm=true
 
 	stack_trap "cleanup_72f $mgsnm $nm" EXIT
 
@@ -9072,7 +9277,7 @@ test_72f() {
 		error "add fileset $fileset_alt2 to $mgsnm failed"
 	wait_nm_sync $mgsnm fileset '' inactive
 
-	if $same_server_node; then
+	if $delete_dyn_nm; then
 		do_facet ost1 $LCTL nodemap_del $nm
 	fi
 
@@ -10473,11 +10678,153 @@ test_78() {
 }
 run_test 78 "nodemap stats"
 
-test_79() {
-	# reserve test_79
-	skip "not implemented yet"
+cleanup_79() {
+	# unmount client
+	if is_mounted $MOUNT; then
+		umount_client $MOUNT || error "umount $MOUNT failed"
+	fi
+
+	cleanup_unload_ssk nm0
+
+	# reset and deactivate nodemaps, remount client
+	do_facet mgs $LCTL nodemap_del nm0
+	$LGSS_SK -l $SK_PATH/$FSNAME.key
+	cleanup_local_client_nodemap c0
+
+	# remount client on $MOUNT_2
+	if [ "$MOUNT_2" ]; then
+		mount_client $MOUNT2 ${MOUNT_OPTS} || error "remount failed"
+	fi
+	wait_ssk
 }
-#run_test 79 "ssk for nodemap identification"
+
+test_79() {
+	client_ip=$(host_nids_address $HOSTNAME $NETTYPE)
+	client_nid=$(h2nettype $client_ip)
+	local banprop
+
+	$SHARED_KEY || skip "Need shared key feature for this test"
+
+	(( MDS1_VERSION >= $(version_code 2.17.50) )) ||
+		skip "Need MDS version >= 2.17.50 for gss identification"
+
+	do_nodes $(comma_list $(all_mdts_nodes)) \
+		$LCTL set_param mdt.*.identity_upcall=NONE
+
+	stack_trap cleanup_79 EXIT
+
+	mds1_mdtcnt=$(do_facet mds1 $LCTL list_param mdt.* | wc -l)
+
+	$LFS mkdir -c1 -i0 $DIR/$tdir
+	$LFS mkdir -c1 -i0 $DIR/$tdir/c0
+	touch $DIR/$tdir/c0/this_is_c0
+	$LFS mkdir -c1 -i0 $DIR/$tdir/nm0
+	touch $DIR/$tdir/nm0/this_is_nm0
+
+	# unmount client completely
+	umount_client $MOUNT || error "umount $MOUNT failed"
+	if is_mounted $MOUNT2; then
+		umount_client $MOUNT2 || error "umount $MOUNT2 failed"
+	fi
+
+	# create nodemap c0, SSK key already created by test framework
+	setup_local_client_nodemap c0 1 1
+	do_facet mgs $LCTL nodemap_modify --name c0 \
+		--property gssonly_identification --value 1 &&
+		error "gssonly_identification on c0 with nid range should fail"
+	do_facet mgs $LCTL nodemap_del_range --name c0 --range $client_nid ||
+		error "del range on c0 failed"
+	do_facet mgs $LCTL nodemap_set_fileset --name c0 \
+		--fileset "/$tdir/c0" ||
+			error "set_fileset on c0 failed"
+	do_facet mgs $LCTL nodemap_modify --name c0 \
+		--property gssonly_identification --value 1 ||
+		error "setting gssonly_identification on c0 failed"
+	do_facet mgs $LCTL nodemap_add_range --name c0 --range $client_nid &&
+		error "add range on c0 with gssonly_identification shoud fail"
+	wait_nm_sync c0 gssonly_identification
+	do_facet mgs $LCTL get_param -R 'nodemap.*'
+
+	# remount client to take nodemap into account
+	zconf_mount_clients $HOSTNAME $MOUNT $MOUNT_OPTS ||
+		error "remount failed (1)"
+	wait_ssk
+
+	[[ -f $DIR/this_is_c0 ]] || error "failed to get c0"
+
+	# test banlist support with gss identification
+	banprop=$(do_facet mgs $LCTL get_param nodemap.c0.banlist)
+	if [[ -n $banprop ]]; then
+		do_facet mgs $LCTL nodemap_banlist_add --name c0 \
+		   --range $client_nid ||
+			error "banlist_add on c0 failed"
+		wait_nm_sync c0 banlist
+		stack_trap "do_facet mgs $LCTL nodemap_banlist_del --name c0 \
+			--range $client_nid || true" EXIT
+		# check client access: should be blocked
+		cancel_lru_locks
+		ls $DIR && error "ls $DIR should fail"
+		cat $DIR/this_is_c0 && error "cat $DIR/this_is_c0 should fail"
+		do_facet mgs $LCTL nodemap_banlist_del --name c0 \
+			--range $client_nid
+		wait_nm_sync c0 banlist
+		cancel_lru_locks
+		ls $DIR || error "ls $DIR failed"
+		cat $DIR/this_is_c0 || error "cat $DIR/this_is_c0 failed"
+	fi
+
+	# unmount client
+	umount_client $MOUNT || error "umount $MOUNT failed"
+
+	# unload c0 key on client
+	keyctl show | grep lustre:$FSNAME | cut -c1-11 | sed -e 's/ //g;' |
+		xargs -IX keyctl revoke X
+	keyctl reap
+
+	# create nodemap nm0
+	do_facet mgs $LCTL nodemap_add nm0
+	do_facet mgs $LCTL nodemap_modify --name nm0 \
+		--property admin --value 1
+	do_facet mgs $LCTL nodemap_modify --name nm0 \
+		--property trusted --value 1
+	do_facet mgs $LCTL nodemap_set_fileset --name nm0 \
+		--fileset "/$tdir/nm0" ||
+			error "set_fileset on nm0 failed"
+	do_facet mgs $LCTL nodemap_modify --name nm0 \
+		--property gssonly_identification --value 1 ||
+		error "setting gssonly_identification on nm0 failed"
+	wait_nm_sync nm0 gssonly_identification
+	do_facet mgs $LCTL get_param -R 'nodemap.*'
+
+	# create ssk for nm0, stack_trap
+	generate_load_ssk nm0
+
+	# mount client, should see nm0 fileset
+	$MOUNT_CMD -o $MOUNT_OPTS $MGSNID:/$FSNAME $MOUNT ||
+		error "remount failed (2)"
+	wait_ssk
+
+	[[ -f $DIR/this_is_nm0 ]] || error "failed to get nm0"
+
+	do_facet mds1 $LCTL get_param nodemap.*.exports
+	count=$(do_facet mds1 $LCTL get_param -n nodemap.nm0.exports |
+		grep -c $client_nid)
+	(( count == mds1_mdtcnt )) ||
+		error "$count exps for $client_nid on nm0 ($mds1_mdtcnt) (1)"
+
+	# change unrelated nodemap property, just to refresh nodemap definitions
+	do_facet mgs $LCTL nodemap_modify --name c0 \
+		--property audit_mode --value 0 ||
+		error "setting audit_mode on c0 failed"
+	wait_nm_sync c0 audit_mode
+
+	do_facet mds1 $LCTL get_param nodemap.*.exports
+	count=$(do_facet mds1 $LCTL get_param -n nodemap.nm0.exports |
+		grep -c $client_nid)
+	(( count == mds1_mdtcnt )) ||
+		error "$count exps for $client_nid on nm0 ($mds1_mdtcnt) (2)"
+}
+run_test 79 "ssk for nodemap identification"
 
 test_81a() {
 	local client_ip=$(host_nids_address $HOSTNAME $NETTYPE)

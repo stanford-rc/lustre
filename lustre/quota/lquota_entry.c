@@ -24,7 +24,7 @@ MODULE_PARM_DESC(hash_lqs_cur_bits, "the current bits of lqe hash");
 static unsigned
 lqe64_hash_hash(struct cfs_hash *hs, const void *key, const unsigned int bits)
 {
-	return cfs_hash_64(*((__u64 *)key), bits);
+	return hash_64(*((__u64 *)key), bits);
 }
 
 static void *lqe64_hash_key(struct hlist_node *hnode)
@@ -257,8 +257,6 @@ static void lqe_init(struct lquota_entry *lqe)
 	LASSERT(site != NULL);
 	LASSERT(site->lqs_ops->lqe_init != NULL);
 
-	LQUOTA_DEBUG(lqe, "init");
-
 	site->lqs_ops->lqe_init(lqe, site->lqs_parent);
 }
 
@@ -305,8 +303,7 @@ static int lqe_read(const struct lu_env *env,
  */
 struct lquota_entry *lqe_locate_find(const struct lu_env *env,
 				     struct lquota_site *site,
-				     union lquota_id *qid,
-				     bool find)
+				     const union lquota_id *qid, bool find)
 {
 	struct lquota_entry	*lqe, *new = NULL;
 	int			 rc = 0;

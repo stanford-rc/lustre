@@ -17,6 +17,13 @@
 
 #include <uapi/linux/lustre/lustre_disk.h>
 #include <uapi/linux/lustre/lustre_ioctl.h>
+#include <crypto/hash.h>
+#ifdef HAVE_CRYPTO_SHA2_HEADER
+#include <crypto/sha2.h>
+#else
+#include <crypto/sha.h>
+#endif
+#include <linux/rhashtable.h>
 
 #define LUSTRE_NODEMAP_NAME "nodemap"
 
@@ -104,7 +111,8 @@ struct lu_nodemap {
 				 nmf_forbid_encryption:1,
 				 nmf_readonly_mount:1,
 				 nmf_deny_mount:1,
-				 nmf_fileset_use_iam:1;
+				 nmf_fileset_use_iam:1,
+				 nmf_gss_identify:1;
 	/* bitmap for mapping type */
 	enum nodemap_mapping_modes nmf_map_mode;
 	/* bitmap for rbac, enum nodemap_rbac_roles */
@@ -188,6 +196,10 @@ struct lu_nodemap {
 	struct lprocfs_stats    *nm_dt_stats;
 	struct lprocfs_stats    *nm_md_stats;
 	struct mutex		 nm_stats_lock;
+	/* sha256 of the nodemap name */
+	char			 nm_sha[SHA256_DIGEST_SIZE];
+	/* access by nodemap name sha hash */
+	struct rhash_head	 nm_sha_hash;
 };
 
 /* Store handles to local MGC storage to save config locally. In future
@@ -201,9 +213,12 @@ struct nm_config_file {
 };
 
 int nodemap_activate(const bool value);
+struct lu_nodemap *nodemap_lookup_unlocked(const char *name);
 int nodemap_add(const char *nodemap_name, bool dynamic);
 int nodemap_del(const char *nodemap_name, bool *out_clean_llog_fileset);
-int nodemap_add_member(struct lnet_nid *nid, struct obd_export *exp);
+void nodemap_clear_dynamic_nodemaps(void);
+int nodemap_add_member(struct ptlrpc_svc_ctx *svc_ctx, struct lnet_nid *nid,
+		       struct obd_export *exp);
 void nodemap_del_member(struct obd_export *exp);
 int nodemap_parse_range(const char *range_string, struct lnet_nid range[2],
 			u8 *netmask);
@@ -234,6 +249,7 @@ int nodemap_set_raise_privs(const char *name, enum nodemap_raise_privs privs,
 			    enum nodemap_rbac_roles rbac_raise);
 int nodemap_set_readonly_mount(const char *name, bool readonly_mount);
 int nodemap_set_deny_mount(const char *name, bool deny_mount);
+int nodemap_set_gss_identify(const char *name, bool gss_identify);
 bool nodemap_can_setquota(struct lu_nodemap *nodemap, __u32 qc_cmd,
 			  __u32 qc_type, __u32 id);
 int nodemap_add_idmap(const char *nodemap_name, enum nodemap_id_type id_type,
@@ -326,6 +342,12 @@ struct nodemap_config {
 	 * nodemaps
 	 */
 	struct cfs_hash *nmc_nodemap_hash;
+
+	/**
+	 * Hash keyed on nodemap name sha
+	 * containing all nodemaps
+	 */
+	struct rhashtable nmc_nodemap_sha_hash;
 };
 
 struct nodemap_config *nodemap_config_alloc(void);

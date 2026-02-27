@@ -4,7 +4,7 @@ if MODULES
 if LDISKFS_ENABLED
 all-local: sources
 
-modulefs_DATA = ldiskfs.ko
+
 
 ldiskfs.ko: sources
 endif
@@ -118,7 +118,7 @@ foo-check:
 	@echo "ldiskfs_OBJECTS: $(ldiskfs_OBJECTS)"
 	@echo "ldiskfs_LDADD: $(ldiskfs_LDADD)"
 
-MOSTLYCLEANFILES := @MOSTLYCLEANFILES@
+
 CLEANFILES = sources $(notdir $(linux_new_headers) $(linux_headers) $(backfs_headers) $(backfs_sources) $(new_sources) $(new_headers) $(trace_headers))
 
 clean-local:

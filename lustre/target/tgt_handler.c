@@ -1337,6 +1337,7 @@ int tgt_sync(const struct lu_env *env, struct lu_target *tgt,
 
 	/* if no objid is specified, it means "sync whole filesystem" */
 	if (obj == NULL) {
+		lu_objects_destroy_delayed();
 		rc = dt_sync(env, tgt->lut_bottom);
 	} else if (dt_version_get(env, obj) >
 		   tgt->lut_obd->obd_last_committed) {
@@ -1881,7 +1882,7 @@ static int tgt_checksum_niobuf(struct lu_target *tgt,
 
 				/* LU-8376 to preserve original index for
 				 * display in dump_all_bulk_pages() */
-				np->index = i;
+				page_folio(np)->index = i;
 
 				cfs_crypto_hash_update_page(req, np, off,
 							    len);
@@ -1914,7 +1915,7 @@ static int tgt_checksum_niobuf(struct lu_target *tgt,
 
 				/* LU-8376 to preserve original index for
 				 * display in dump_all_bulk_pages() */
-				np->index = i;
+				page_folio(np)->index = i;
 
 				cfs_crypto_hash_update_page(req, np, off,
 							    len);
@@ -2144,7 +2145,7 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 
 				/* LU-8376 to preserve original index for
 				 * display in dump_all_bulk_pages() */
-				np->index = i;
+				page_folio(np)->index = i;
 
 				cfs_crypto_hash_update_page(req, np, off,
 							    len);
@@ -2265,7 +2266,7 @@ static int tgt_checksum_niobuf_t10pi(struct lu_target *tgt,
 
 				/* LU-8376 to preserve original index for
 				 * display in dump_all_bulk_pages() */
-				np->index = i;
+				page_folio(np)->index = i;
 
 				cfs_crypto_hash_update_page(req, np, off,
 							    len);

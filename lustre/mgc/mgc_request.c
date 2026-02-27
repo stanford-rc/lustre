@@ -1033,7 +1033,7 @@ static int mgc_cancel(struct obd_export *exp, enum ldlm_mode mode,
 	RETURN(0);
 }
 
-static void mgc_notify_active(struct obd_device *unused)
+static void mgc_notify_active(struct obd_device *mgc)
 {
 	/* wakeup mgc_requeue_thread to requeue mgc lock */
 	spin_lock(&config_list_lock);
@@ -1041,7 +1041,8 @@ static void mgc_notify_active(struct obd_device *unused)
 	spin_unlock(&config_list_lock);
 	wake_up(&rq_waitq);
 
-	/* TODO: Help the MGS rebuild nidtbl. -jay */
+	/* rebuild NID table on MGS from target on this MGC */
+	obd_notify_observer(mgc, mgc, OBD_NOTIFY_ACTIVE);
 }
 
 static int mgc_set_info_async(const struct lu_env *env, struct obd_export *exp,
@@ -1205,7 +1206,7 @@ static int mgc_create_new_conn(struct obd_import *imp, struct lnet_nid *nidlist,
 	struct obd_uuid node_uuid;
 	char prim_nid[LNET_NIDSTR_SIZE] = { 0 };
 	int i = 0;
-	int rc;
+	int rc = 0;
 
 	/* client has no existing connection to that target yet, and
 	 * it has list of target NIDs, which may have NIDs on
@@ -2054,7 +2055,7 @@ static const struct obd_ops mgc_obd_ops = {
 };
 
 static int mgc_param_requeue_timeout_min_set(const char *val,
-				     cfs_kernel_param_arg_t *kp)
+				     const struct kernel_param *kp)
 {
 	int rc;
 	unsigned int num;
@@ -2079,12 +2080,7 @@ static const struct kernel_param_ops param_ops_requeue_timeout_min = {
 		__param_check(name, p, unsigned int)
 
 unsigned int mgc_requeue_timeout_min = MGC_TIMEOUT_MIN_SECONDS;
-#ifdef HAVE_KERNEL_PARAM_OPS
 module_param(mgc_requeue_timeout_min, requeue_timeout_min, 0644);
-#else
-module_param_call(mgc_requeue_timeout_min, mgc_param_requeue_timeout_min_set,
-		  param_get_uint, &param_ops_requeue_timeout_min, 0644);
-#endif
 MODULE_PARM_DESC(mgc_requeue_timeout_min, "Minimal requeue time to refresh logs");
 
 static int __init mgc_init(void)

@@ -35,18 +35,20 @@
 /**************** config llog ********************/
 
 /**
- * Get a config log from the MGS and process it.
- * This func is called for both clients and servers.
- * Continue to process new statements appended to the logs
- * (whenever the config lock is revoked) until lustre_end_log
- * is called.
- *
- * @param sb The superblock is used by the MGC to write to the local copy of
- *   the config log
- * @param logname The name of the llog to replicate from the MGS
- * @param cfg Since the same MGC may be used to follow multiple config logs
+ * lustre_process_log() - Get a config log from the MGS and process it.
+ * @sb: The superblock is used by the MGC to write to local copy of config log
+ * @logname: The name of the llog to replicate from the MGS
+ * @cfg: Since the same MGC may be used to follow multiple config logs
  *   (e.g. ost1, ost2, client), the config_llog_instance keeps the state for
  *   this log, and is added to the mgc's list of logs to follow.
+ *
+ * This func is called for both clients and servers.
+ * Continue to process new statements appended to the logs
+ * (whenever the config lock is revoked) until lustre_end_log is called.
+ *
+ * Return:
+ * * %0 on success
+ * * %negative on failure
  */
 int lustre_process_log(struct super_block *sb, char *logname,
 		       struct config_llog_instance *cfg)
@@ -92,7 +94,16 @@ out:
 }
 EXPORT_SYMBOL(lustre_process_log);
 
-/* Stop watching this config log for updates */
+/**
+ * lustre_end_log() - Stop watching this config log for updates
+ * @sb: The superblock is used by the MGC to write to local copy of config log
+ * @logname: The name of the llog to replicate from the MGS
+ * @cfg: keeps state for this log, and is added to MGC's list of logs to follow.
+ *
+ * Return:
+ * * %0 on success
+ * * %negative on failure
+ */
 int lustre_end_log(struct super_block *sb, char *logname,
 		   struct config_llog_instance *cfg)
 {
@@ -124,7 +135,7 @@ EXPORT_SYMBOL(lustre_end_log);
 
 /**************** OBD start *******************/
 
-/**
+/*
  * lustre_cfg_bufs are a holdover from 1.4; we can still set these up from
  * lctl (and do for echo cli/srv.
  */
@@ -172,8 +183,21 @@ static int do_lcfg_nid(char *cfgname, struct lnet_nid *nid, int cmd,
 }
 
 /**
+ * lustre_start_simple() - Call class_attach and class_setup.
+ * @obdname: name of new obd device
+ * @type: type of device to start/setup/attach (mdt, ost, mgc)
+ * @uuid: uuid of the device
+ * @s1: optional argument
+ * @s2: optional argument
+ * @s3: optional argument
+ * @s4: optional argument
+ *
  * Call class_attach and class_setup.  These methods in turn call
  * OBD type-specific methods.
+ *
+ * Return:
+ * * %0 on success
+ * * %negative on failure
  */
 SERVER_ONLY
 int lustre_start_simple(char *obdname, char *type, char *uuid,
@@ -199,7 +223,7 @@ SERVER_ONLY_EXPORT_SYMBOL(lustre_start_simple);
 
 static DEFINE_MUTEX(mgc_start_lock);
 
-/**
+/*
  * Parse MGS failover nodes from provided NID list and add
  * them to existing MGC import
  */
@@ -254,11 +278,10 @@ static bool lustre_add_mgc_failnodes(struct obd_device *obd, char *ptr)
 }
 
 /**
- * Set up a MGC OBD to process startup logs
+ * lustre_start_mgc() - Set up a MGC OBD to process startup logs
+ * @sb: super block of the MGC OBD
  *
- * \param sb [in] super block of the MGC OBD
- *
- * \retval 0 success, otherwise error code
+ * Return 0 success, otherwise error code
  */
 int lustre_start_mgc(struct super_block *sb)
 {
@@ -600,20 +623,42 @@ SERVER_ONLY_EXPORT_SYMBOL(lustre_stop_mgc);
 
 /***************** lustre superblock **************/
 
-struct lustre_sb_info *lustre_init_lsi(struct super_block *sb)
+static void lustre_put_lsm_free(struct kref *kref)
 {
+	struct lustre_mount_data *lmd = container_of(kref,
+						     struct lustre_mount_data,
+						     lmd_ref);
+	OBD_FREE(lmd->lmd_dev, strlen(lmd->lmd_dev) + 1);
+	OBD_FREE(lmd->lmd_profile, strlen(lmd->lmd_profile) + 1);
+	OBD_FREE(lmd->lmd_fileset, strlen(lmd->lmd_fileset) + 1);
+	OBD_FREE(lmd->lmd_mgssec, strlen(lmd->lmd_mgssec) + 1);
+	OBD_FREE(lmd->lmd_opts, strlen(lmd->lmd_opts) + 1);
+	if (lmd->lmd_exclude_count)
+		OBD_FREE_PTR_ARRAY(lmd->lmd_exclude,
+				   lmd->lmd_exclude_count);
+	OBD_FREE(lmd->lmd_mgs, strlen(lmd->lmd_mgs) + 1);
+	OBD_FREE(lmd->lmd_mgsname, strlen(lmd->lmd_mgsname) + 1);
+	OBD_FREE(lmd->lmd_osd_type, strlen(lmd->lmd_osd_type) + 1);
+	OBD_FREE(lmd->lmd_params, 4096);
+	OBD_FREE(lmd->lmd_nidnet, strlen(lmd->lmd_nidnet) + 1);
+	OBD_FREE_PTR(lmd);
+}
+
+struct lustre_sb_info *lustre_init_lsi(struct fs_context *fc, struct super_block *sb)
+{
+	struct lustre_mount_data *lmd = fc->fs_private;
 	struct lustre_sb_info *lsi;
 
 	ENTRY;
+	if (!lmd)
+		RETURN(NULL);
 
 	OBD_ALLOC_PTR(lsi);
 	if (!lsi)
 		RETURN(NULL);
-	OBD_ALLOC_PTR(lsi->lsi_lmd);
-	if (!lsi->lsi_lmd) {
-		OBD_FREE_PTR(lsi);
-		RETURN(NULL);
-	}
+
+	kref_get(&lmd->lmd_ref);
+	lsi->lsi_lmd = lmd;
 
 	s2lsi_nocast(sb) = lsi;
 	/* we take 1 extra ref for our setup */
@@ -640,35 +685,9 @@ static int lustre_free_lsi(struct lustre_sb_info *lsi)
 	LASSERT(kref_read(&lsi->lsi_mounts) == 0);
 
 	llcrypt_sb_free(lsi);
-	if (lsi->lsi_lmd != NULL) {
-		OBD_FREE(lsi->lsi_lmd->lmd_dev,
-			 strlen(lsi->lsi_lmd->lmd_dev) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_profile,
-			 strlen(lsi->lsi_lmd->lmd_profile) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_fileset,
-			 strlen(lsi->lsi_lmd->lmd_fileset) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_mgssec,
-			 strlen(lsi->lsi_lmd->lmd_mgssec) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_opts,
-			 strlen(lsi->lsi_lmd->lmd_opts) + 1);
-		if (lsi->lsi_lmd->lmd_exclude_count)
-			OBD_FREE(lsi->lsi_lmd->lmd_exclude,
-				sizeof(lsi->lsi_lmd->lmd_exclude[0]) *
-				lsi->lsi_lmd->lmd_exclude_count);
-		OBD_FREE(lsi->lsi_lmd->lmd_mgs,
-			 strlen(lsi->lsi_lmd->lmd_mgs) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_mgsname,
-			 strlen(lsi->lsi_lmd->lmd_mgsname) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_osd_type,
-			 strlen(lsi->lsi_lmd->lmd_osd_type) + 1);
-		OBD_FREE(lsi->lsi_lmd->lmd_params, 4096);
-		OBD_FREE(lsi->lsi_lmd->lmd_nidnet,
-			 strlen(lsi->lsi_lmd->lmd_nidnet) + 1);
-
-		OBD_FREE_PTR(lsi->lsi_lmd);
-	}
-
-	LASSERT(lsi->lsi_llsbi == NULL);
+	if (lsi->lsi_lmd)
+		kref_put(&lsi->lsi_lmd->lmd_ref, lustre_put_lsm_free);
+	LASSERT(!lsi->lsi_llsbi);
 	OBD_FREE_PTR(lsi);
 
 	RETURN(0);
@@ -711,7 +730,7 @@ int lustre_put_lsi(struct super_block *sb)
 }
 EXPORT_SYMBOL(lustre_put_lsi);
 
-/**
+/*
  * SERVER NAME ***
  * <FSNAME><SEPARATOR><TYPE><INDEX>
  * FSNAME is between 1 and 8 characters (inclusive).
@@ -722,12 +741,17 @@ EXPORT_SYMBOL(lustre_put_lsi);
  */
 
 /**
+ * server_name2fsname() - Get the fsname from the server name
+ * @svname: server name including type and index
+ * @fsname: Buffer to copy filesystem name prefix into. Must have at least
+ * 'strlen(fsname) + 1' chars [out]
+ * @endptr: if endptr isn't NULL it is set to end of fsname [out]
+ *
  * Get the fsname ("lustre") from the server name ("lustre-OST003F").
- * @param [in] svname server name including type and index
- * @param [out] fsname Buffer to copy filesystem name prefix into.
- *  Must have at least 'strlen(fsname) + 1' chars.
- * @param [out] endptr if endptr isn't NULL it is set to end of fsname
- * rc < 0  on error
+ *
+ * Return:
+ * * %0 on success
+ * * %negative on error
  */
 int server_name2fsname(const char *svname, char *fsname, const char **endptr)
 {
@@ -753,9 +777,15 @@ EXPORT_SYMBOL(server_name2fsname);
 
 #ifdef HAVE_SERVER_SUPPORT
 /**
- * Get service name (svname) from string
- * rc < 0 on error
- * if endptr isn't NULL it is set to end of fsname *
+ * server_name2svname() - Get service name (svname) from string (server)
+ * @label: server name from which to extract service name
+ * @svname: buffer to store extracted service name [out]
+ * @endptr: if endptr isn't NULL it is set to end of fsname
+ * @svsize: size of @svname
+ *
+ * Return:
+ * * %0 on success
+ * * %negative on error
  */
 int server_name2svname(const char *label, char *svname, const char **endptr,
 		       size_t svsize)
@@ -781,8 +811,14 @@ EXPORT_SYMBOL(server_name2svname);
 #endif /* HAVE_SERVER_SUPPORT */
 
 /**
- * Get the index from the target name MDTXXXX/OSTXXXX
- * rc = server type, or rc < 0  on error
+ * target_name2index() - Get the index from the target name MDTXXXX/OSTXXXX
+ * @tgtname: target name from which to extract index
+ * @idx: place to store extracted index [out]
+ * @endptr: if endptr isn't NULL it is set to end of tgtname [out]
+ *
+ * Return:
+ * * %positive (server type) on success
+ * * %negative on error
  **/
 SERVER_ONLY int target_name2index(const char *tgtname, u32 *idx, const char **endptr)
 {
@@ -1144,6 +1180,7 @@ static const match_table_t lmd_flags_table = {
 	{LMD_FLG_ABORT_RECOV_MDT,	"abort_recov_mdt"},
 	{LMD_FLG_ABORT_RECOV_MDT,	"abort_recovery_mdt"},
 	{LMD_FLG_NO_LOCAL_LOGS,		"nolocallogs"},
+	{LMD_FLG_NO_RCLNT,		"noclient"},
 
 	{LMD_OPT_RECOVERY_TIME_SOFT,	"recovery_time_soft=%u"},
 	{LMD_OPT_RECOVERY_TIME_HARD,	"recovery_time_hard=%u"},
@@ -1159,7 +1196,7 @@ static const match_table_t lmd_flags_table = {
 	{LMD_NUM_MOUNT_OPT,		NULL}
 };
 
-/**
+/*
  * Find the first delimiter; comma; from the specified \a buf and
  * make \a *endh point to the string starting with the delimiter.
  * The character ':' is also a delimiter for Lustre but not match_table
@@ -1204,7 +1241,7 @@ static bool lmd_find_delimiter(char *buf, char **endh)
 	return true;
 }
 
-/**
+/*
  * Make sure the string in \a buf is of a valid formt.
  *
  * @buf		a delimiter-separated string
@@ -1263,7 +1300,7 @@ try_again:
 	return true;
 }
 
-/**
+/*
  * Find the first valid string delimited by comma or colon from the specified
  * @buf and parse it to see whether it's a valid nid list. If yes, @*endh
  * will point to the next string starting with the delimiter.
@@ -1309,14 +1346,21 @@ failed:
 }
 
 /**
- * Parse mount line options
+ * lmd_parse() - Parse mount line options
+ * @options: string passed to the mount
+ * @lmd: struct lustre_mount_data populated based on @options [out]
+ *
  * e.g. mount -v -t lustre -o abort_recov uml1:uml2:/lustre-client /mnt/lustre
  * dev is passed as device=uml1:/lustre by mount.lustre_tgt
+ *
+ * Return:
+ * * %0 on success
+ * * %negative on failure
  */
-int lmd_parse(char *options, struct lustre_mount_data *lmd)
+int lustre_parse_monolithic(struct fs_context *fc, void *lmd2_data)
 {
-	char *s1, *s2, *opts, *orig_opts, *devname = NULL;
-	struct lustre_mount_data *raw = (struct lustre_mount_data *)options;
+	char *options = lmd2_data, *s1, *s2, *opts, *orig_opts, *devname = NULL;
+	struct lustre_mount_data *lmd = fc->fs_private, *raw = lmd2_data;
 	int rc = 0;
 
 	ENTRY;
@@ -1412,6 +1456,7 @@ int lmd_parse(char *options, struct lustre_mount_data *lmd)
 		case LMD_FLG_NO_PRIMNODE:
 		case LMD_FLG_MGS: /* We are an MGS */
 		case LMD_FLG_LOCAL_RECOV:
+		case LMD_FLG_NO_RCLNT:
 			set_bit(token, lmd->lmd_flags);
 			break;
 		case LMD_OPT_RECOVERY_TIME_SOFT:
@@ -1430,17 +1475,18 @@ int lmd_parse(char *options, struct lustre_mount_data *lmd)
 			rc = lmd_parse_string(&lmd->lmd_mgsname, args->from);
 			break;
 		case LMD_OPT_MGSNODE:
+			s2 = opts;
 			/* Assume the next mount opt is the first
 			 * invalid NID we get to.
 			 */
 			rc = lmd_parse_mgs(lmd, args->from, &opts);
 			if (rc < 0)
 				GOTO(invalid, rc);
+			/* Remove extra NIDs from options string */
+			if (strlen(s2) != strlen(opts)) {
+				char *tmp = strstr(options, s2);
 
-			if (strcmp(options, opts) != 0) {
-				s2 = strstr(options, opts);
-				if (s2)
-					options = s2;
+				memmove(tmp, opts, strlen(opts) + 1);
 			}
 			break;
 		case LMD_OPT_MGSSEC:
@@ -1639,4 +1685,13 @@ invalid:
 
 	RETURN(rc);
 }
-EXPORT_SYMBOL(lmd_parse);
+EXPORT_SYMBOL(lustre_parse_monolithic);
+
+void lustre_fc_free(struct fs_context *fc)
+{
+	struct lustre_mount_data *lmd = fc->fs_private;
+
+	kref_put(&lmd->lmd_ref, lustre_put_lsm_free);
+	fc->fs_private = NULL;
+}
+EXPORT_SYMBOL(lustre_fc_free);

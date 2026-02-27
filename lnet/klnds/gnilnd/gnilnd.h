@@ -50,6 +50,8 @@
 #include <linux/in.h>
 #include <linux/nmi.h>
 
+#include <lustre_compat/linux/timer.h>
+#include <linux/libcfs/libcfs_fail.h>
 #include <lnet/lib-lnet.h>
 
 #include <gni_pub.h>
@@ -334,29 +336,28 @@ typedef enum kgn_dgram_type {
 #define GNILND_DGRAM_MAGIC   0x0DDBA11
 
 /*  kgn_msg_t - FMA/SMSG wire struct
-  v2:
-   * - added checksum to FMA
-   * moved seq before paylod
-   * __packed added for alignment
-  v3:
-   * added gnm_payload_len for FMA payload size
-  v4:
-   * added gncm_retval to completion, allowing return code transmission
-     on RDMA NAKs
-  v5:
-   * changed how CQID and TX ids are assigned
-  v6:
-   * added retval on CLOSE
-  v7:
-   * added payload checksumming
-  v8:
-   * reworked checksumming a bit, changed payload checksums
-*/
+ * v2:
+ * * added checksum to FMA
+ * * moved seq before paylod
+ * * __packed added for alignment
+ * v3:
+ * * added gnm_payload_len for FMA payload size
+ * v4:
+ * * add gncm_retval to completion, allow return code transmission on RDMA NAKs
+ * v5:
+ * * changed how CQID and TX ids are assigned
+ * v6:
+ * * added retval on CLOSE
+ * v7:
+ * * added payload checksumming
+ * v8:
+ * * reworked checksumming a bit, changed payload checksums
+ */
 #define GNILND_MSG_VERSION              8
 /* kgn_connreq_t connection request datagram wire struct
-  v2:
-   * added NAKs
-*/
+ * v2:
+ * * added NAKs
+ */
 
 #define GNILND_CONNREQ_VERSION          2
 
@@ -993,10 +994,11 @@ static inline void *kgnilnd_vzalloc(int size)
 {
 	void *ret;
 	if (*kgnilnd_tunables.kgn_vzalloc_noretry)
-		ret = __ll_vmalloc(size, __GFP_HIGHMEM | GFP_NOIO | __GFP_ZERO |
-				   __GFP_NORETRY);
+		ret = __compat_vmalloc(size, __GFP_HIGHMEM | GFP_NOIO |
+				       __GFP_ZERO | __GFP_NORETRY);
 	else
-		ret = __ll_vmalloc(size, __GFP_HIGHMEM | GFP_NOIO | __GFP_ZERO);
+		ret = __compat_vmalloc(size, __GFP_HIGHMEM | GFP_NOIO |
+				       __GFP_ZERO);
 
 	LIBCFS_ALLOC_POST(ret, size, "alloc");
 	return ret;

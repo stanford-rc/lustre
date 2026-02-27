@@ -888,6 +888,7 @@ static inline int sec_is_rootonly(struct ptlrpc_sec *sec)
 struct ptlrpc_svc_ctx {
 	atomic_t                        sc_refcount;
 	struct ptlrpc_sec_policy       *sc_policy;
+	char			       *sc_nodemap;
 };
 
 /*
@@ -1172,6 +1173,7 @@ struct gss_svc_ctx {
 				gsc_usr_oss:1,
 				gsc_remote:1,
 				gsc_reverse:1;
+	char		       *gsc_nm_name;
 };
 
 int sptlrpc_svc_install_rvs_ctx(struct obd_import *imp,

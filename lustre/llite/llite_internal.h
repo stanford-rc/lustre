@@ -76,9 +76,7 @@ static inline void set_lld_invalid(struct dentry *de, int flag)
 #define LLI_INODE_DEAD                  0xdeadd00d
 
 struct ll_getname_data {
-#ifdef HAVE_DIR_CONTEXT
 	struct dir_context	ctx;
-#endif
 	char		*lgd_name;	/* points to buf with NAME_MAX+1 size */
 	struct lu_fid	lgd_fid;	/* target fid we are looking for */
 	int		lgd_found;	/* inode matched? */
@@ -871,6 +869,7 @@ struct ll_sb_info {
 	unsigned int		 ll_checksum_set:1,
 				 ll_client_common_fill_super_succeeded:1,
 				 ll_dir_open_read:1,
+				 ll_enable_erasure_coding:1,
 				 ll_enable_statahead_fname:1,
 				 ll_inode_cache_enabled:1,
 				 ll_intent_mkdir_enabled:1,
@@ -1107,6 +1106,7 @@ struct ll_readahead_work {
 };
 
 extern struct kmem_cache *ll_file_data_slab;
+extern unsigned int llite_enable_flr_ec;
 struct lustre_handle;
 struct ll_file_data {
 	struct file			*fd_file;
@@ -1285,13 +1285,8 @@ enum get_default_layout_type {
 extern const struct file_operations ll_dir_operations;
 extern const struct inode_operations ll_dir_inode_operations;
 extern struct kmem_cache *quota_iter_slab;
-#ifdef HAVE_DIR_CONTEXT
 int ll_dir_read(struct inode *inode, __u64 *pos, struct md_op_data *op_data,
 		struct dir_context *ctx, int *partial_readdir_rc);
-#else
-int ll_dir_read(struct inode *inode, __u64 *pos, struct md_op_data *op_data,
-		void *cookie, filldir_t filldir, int *partial_readdir_rc);
-#endif
 int ll_get_mdt_idx(struct inode *inode);
 int ll_get_mdt_idx_by_fid(struct ll_sb_info *sbi, const struct lu_fid *fid);
 struct page *ll_get_dir_page(struct inode *dir, struct md_op_data *op_data,
@@ -1509,7 +1504,6 @@ int ll_iocontrol(struct inode *inode, struct file *file,
 		 unsigned int cmd, void __user *uarg);
 int ll_flush_ctx(struct inode *inode);
 void ll_umount_begin(struct super_block *sb);
-int ll_remount_fs(struct super_block *sb, int *flags, char *data);
 int ll_show_options(struct seq_file *seq, struct dentry *dentry);
 void ll_dirty_page_discard_warn(struct inode *inode, int ioret);
 int ll_prep_inode(struct inode **inode, struct req_capsule *pill,
@@ -1580,7 +1574,7 @@ struct vvp_io_args {
 		} normal;
 	} u;
 	/* did we switch this IO from BIO to DIO using hybrid IO? */
-	int	via_hybrid_switched:1;
+	unsigned int	via_hybrid_switched:1;
 };
 
 static inline unsigned int iocb_ki_flags_get(const struct file *file,

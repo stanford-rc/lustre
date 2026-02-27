@@ -279,7 +279,6 @@ static void mdt_empty_transno(struct mdt_thread_info *info, int rc)
 
 /**
  * mdt_mfd_set_mode() - Set MDS open flags into @mfd
- *
  * @mfd: mdt_file_data object per open handle
  * @open_flags: open flags passed from client
  */
@@ -296,7 +295,6 @@ void mdt_mfd_set_mode(struct mdt_file_data *mfd, enum mds_open_flags open_flags)
 
 /**
  * mdt_prep_ma_buf_from_rep() - prep ma_lmm/ma_lmv for md_attr from reply
- *
  * @info: Common data shared by mdt-level handlers
  * @obj: metadata object
  * @ma: attributes to be evaluated for that object
@@ -1071,7 +1069,7 @@ static void mdt_object_open_unlock(struct mdt_thread_info *info,
 	RETURN_EXIT;
 }
 
-/**
+/*
  * Check release is permitted for the current HSM flags.
  */
 static bool mdt_hsm_release_allow(const struct md_attr *ma)
@@ -1829,7 +1827,7 @@ out:
 	return result;
 }
 
-/**
+/*
  * Create an orphan object use local root.
  */
 static struct mdt_object *mdt_orphan_open(struct mdt_thread_info *info,
@@ -2581,6 +2579,7 @@ int mdt_mfd_close(struct mdt_thread_info *info, struct mdt_file_data *mfd)
 	struct md_object *next = mdt_object_child(o);
 	struct md_attr *ma = &info->mti_attr;
 	struct lu_fid *ofid = &info->mti_tmp_fid1;
+	bool rdonly = mdt_rdonly(info->mti_exp);
 	int rc = 0;
 	int rc2;
 	u64 open_flags;
@@ -2639,7 +2638,7 @@ int mdt_mfd_close(struct mdt_thread_info *info, struct mdt_file_data *mfd)
 	}
 
 	if (S_ISREG(lu_object_attr(&o->mot_obj)) &&
-	    ma->ma_attr.la_valid & (LA_LSIZE | LA_LBLOCKS)) {
+	    ma->ma_attr.la_valid & (LA_LSIZE | LA_LBLOCKS) && !rdonly) {
 		rc2 = mdt_lsom_update(info, o, false);
 		if (rc2 < 0) {
 			CDEBUG(D_INODE,
@@ -2662,7 +2661,7 @@ int mdt_mfd_close(struct mdt_thread_info *info, struct mdt_file_data *mfd)
 	     open_flags & MDS_FMODE_WRITE) && (ma->ma_valid & MA_INODE) &&
 	    (ma->ma_attr.la_valid & LA_ATIME ||
 	     ma->ma_attr.la_valid & LA_MTIME ||
-	     ma->ma_attr.la_valid & LA_CTIME)) {
+	     ma->ma_attr.la_valid & LA_CTIME) && !rdonly) {
 		ma->ma_valid = MA_INODE;
 		ma->ma_attr_flags |= MDS_CLOSE_UPDATE_TIMES;
 		ma->ma_attr.la_valid &= (LA_ATIME | LA_MTIME | LA_CTIME);

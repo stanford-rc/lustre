@@ -431,13 +431,10 @@ static void osd_dir_it_put(const struct lu_env *env, struct dt_it *di)
  * * %0 - on success
  * * %1 - on buffer full
  */
-#ifdef HAVE_FILLDIR_USE_CTX
 static FILLDIR_TYPE do_osd_memfs_filldir(struct dir_context *ctx,
-#else
-static int osd_memfs_filldir(void *ctx,
-#endif
-			     const char *name, int namelen,
-			     loff_t offset, __u64 ino, unsigned int d_type)
+					 const char *name, int namelen,
+					 loff_t offset, u64 ino,
+					 unsigned int d_type)
 {
 	struct memfs_dir_context *mctx = (struct memfs_dir_context *)ctx;
 	struct osd_it *oit = (struct osd_it *)mctx->cbdata;
@@ -557,13 +554,7 @@ static int osd_memfs_it_fill(const struct lu_env *env, const struct dt_it *di)
 			rc = filp->f_op->iterate_shared(filp, &mctx.super);
 			filp->f_pos = mctx.super.pos;
 		} else {
-#ifdef HAVE_FOP_READDIR
-			rc = filp->f_op->readdir(filp, &mctx.super,
-						 mctx.super.actor);
-			mctx.super.pos = filp->f_pos;
-#else
 			rc = -ENOTDIR;
-#endif
 		}
 	}
 #ifdef HAVE_FOP_ITERATE_SHARED
@@ -793,7 +784,7 @@ static int osd_dir_it_load(const struct lu_env *env,
 	RETURN(rc);
 }
 
-const struct dt_index_operations osd_dir_ops = {
+const struct dt_index_operations osd_wbcfs_dir_ops = {
 	.dio_lookup		= osd_index_dir_lookup,
 	.dio_insert		= osd_index_dir_insert,
 	.dio_delete		= osd_index_dir_delete,

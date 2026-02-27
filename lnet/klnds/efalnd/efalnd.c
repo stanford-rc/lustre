@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 /*
- * Copyright (c) 2023-2025, Amazon and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023-2026, Amazon and/or its affiliates. All rights reserved.
  * Use is subject to license terms.
  */
 
@@ -2103,8 +2103,7 @@ kefalnd_destroy_tx_pool(struct kefa_ni *efa_ni)
 	for (i = 0; i < pool_size; i++) {
 		struct kefa_tx *tx = &((struct kefa_tx *)tx_pool->obj_arr)[i];
 
-		if (tx->frags)
-			LIBCFS_FREE(tx->frags, (EFALND_MAX_TX_FRAGS) * sizeof(*tx->frags));
+		LIBCFS_FREE(tx->frags, (EFALND_MAX_TX_FRAGS) * sizeof(*tx->frags));
 		if (tx->msg) {
 			ib_dma_unmap_single(efa_ni->efa_dev->ib_dev,
 					    tx->msgaddr,
@@ -3126,9 +3125,10 @@ kefalnd_startup(struct lnet_ni *ni)
 	CDEBUG(D_MALLOC, "After NI[%s] startup: kmem[%lld]\n",
 	       ni->ni_interface, libcfs_kmem_read());
 
-	LCONSOLE_INFO("Started NI[%s] EFA device[%s] FW[0x%llx] LND[%s] CPT[%d]\n",
+	LCONSOLE_INFO("Started NI[%s] EFA device[%s] FW[0x%llx] Lustre[%s] LND[%s] CPT[%d]\n",
 		      libcfs_nidstr(&ni->ni_nid), efa_dev->ifname,
 		      efa_dev->ib_dev->attrs.fw_ver,
+		      LUSTRE_VERSION_STRING,
 		      DRV_MODULE_VERSION, efa_dev->cpt);
 
 	return 0;

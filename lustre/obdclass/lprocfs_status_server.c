@@ -81,53 +81,6 @@ ssize_t evict_client_store(struct kobject *kobj, struct attribute *attr,
 }
 EXPORT_SYMBOL(evict_client_store);
 
-#ifdef CONFIG_PROC_FS
-#define BUFLEN LNET_NIDSTR_SIZE
-
-ssize_t
-lprocfs_evict_client_seq_write(struct file *file, const char __user *buffer,
-			       size_t count, loff_t *off)
-{
-	struct seq_file *m = file->private_data;
-	struct obd_device *obd = m->private;
-	char *tmpbuf, *kbuf;
-
-	OBD_ALLOC(kbuf, BUFLEN);
-	if (kbuf == NULL)
-		return -ENOMEM;
-
-	/*
-	 * OBD_ALLOC() will zero kbuf, but we only copy BUFLEN - 1
-	 * bytes into kbuf, to ensure that the string is NUL-terminated.
-	 * LNET_NIDSTR_SIZE includes space for a trailing NUL already.
-	 */
-	if (copy_from_user(kbuf, buffer,
-			   min_t(unsigned long, BUFLEN - 1, count))) {
-		count = -EFAULT;
-		goto out;
-	}
-	tmpbuf = skip_spaces(kbuf);
-	tmpbuf = strsep(&tmpbuf, " \t\n\f\v\r");
-	class_incref(obd, __func__, current);
-
-	if (strncmp(tmpbuf, "nid:", 4) == 0)
-		obd_export_evict_by_nid(obd, tmpbuf + 4);
-	else if (strncmp(tmpbuf, "uuid:", 5) == 0)
-		obd_export_evict_by_uuid(obd, tmpbuf + 5);
-	else
-		obd_export_evict_by_uuid(obd, tmpbuf);
-
-	class_decref(obd, __func__, current);
-
-out:
-	OBD_FREE(kbuf, BUFLEN);
-	return count;
-}
-EXPORT_SYMBOL(lprocfs_evict_client_seq_write);
-
-#undef BUFLEN
-#endif /* CONFIG_PROC_FS*/
-
 ssize_t eviction_count_show(struct kobject *kobj, struct attribute *attr,
 			 char *buf)
 {
@@ -315,17 +268,16 @@ static void lprocfs_free_client_stats(struct nid_stat *client_stat)
 
 void lprocfs_free_per_client_stats(struct obd_device *obd)
 {
-	struct cfs_hash *hash = obd->obd_nid_stats_hash;
 	struct nid_stat *stat;
-	ENTRY;
 
+	ENTRY;
 	/* we need extra list - because hash_exit called to early */
 	/* not need locking because all clients is died */
 	while (!list_empty(&obd->obd_nid_stats)) {
 		stat = list_first_entry(&obd->obd_nid_stats,
 					struct nid_stat, nid_list);
 		list_del_init(&stat->nid_list);
-		cfs_hash_del(hash, &stat->nid, &stat->nid_hash);
+		obd_nid_stats_put(obd, stat);
 		lprocfs_free_client_stats(stat);
 	}
 	EXIT;
@@ -432,7 +384,7 @@ ldebugfs_exp_print_hash_seq(struct obd_export *exp, void *cb_data)
 	struct seq_file *m = cb_data;
 
 	if (exp->exp_lock_hash != NULL) {
-		seq_printf(m, "%-*s   cur   min        max theta t-min t-max flags rehash   count distribution\n",
+		seq_printf(m, "%-*s   cur   min        max theta t-min t-max flags  rehash   count  maxdep distribution\n",
 			   HASH_NAME_LEN, "name");
 		ldebugfs_rhash_seq_show("NID_HASH", &obd->obd_nid_hash.ht, m);
 	}
@@ -505,8 +457,8 @@ EXPORT_SYMBOL(lprocfs_nid_stats_clear_seq_show);
 static int ldebugfs_nid_stats_clear_write_cb(void *obj, void *data)
 {
 	struct nid_stat *stat = obj;
-	ENTRY;
 
+	ENTRY;
 	CDEBUG(D_INFO, "refcnt %d\n", atomic_read(&stat->nid_exp_ref_count));
 	if (atomic_read(&stat->nid_exp_ref_count) == 1) {
 		/* object has only hash references. */
@@ -515,7 +467,7 @@ static int ldebugfs_nid_stats_clear_write_cb(void *obj, void *data)
 		spin_unlock(&stat->nid_obd->obd_nid_lock);
 		RETURN(1);
 	}
-	/* we has reference to object - only clear data*/
+	/* we has reference to object - only clear data */
 	if (stat->nid_stats)
 		lprocfs_stats_clear(stat->nid_stats);
 
@@ -529,10 +481,23 @@ ldebugfs_nid_stats_clear_seq_write(struct file *file, const char __user *buffer,
 	struct seq_file *m = file->private_data;
 	struct obd_device *obd = m->private;
 	struct nid_stat *client_stat;
+	struct rhashtable_iter iter;
 	LIST_HEAD(free_list);
 
-	cfs_hash_cond_del(obd->obd_nid_stats_hash,
-			  ldebugfs_nid_stats_clear_write_cb, &free_list);
+	rhashtable_walk_enter(&obd->obd_nid_stats_hash.ht, &iter);
+	rhashtable_walk_start(&iter);
+	while ((client_stat = rhashtable_walk_next(&iter)) != NULL) {
+		if (IS_ERR(client_stat)) {
+			if (PTR_ERR(client_stat) == -EAGAIN)
+				continue;
+			break;
+		}
+
+		if (ldebugfs_nid_stats_clear_write_cb(client_stat, &free_list))
+			obd_nid_stats_put(obd, client_stat);
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
 
 	while (!list_empty(&free_list)) {
 		client_stat = list_first_entry(&free_list, struct nid_stat,
@@ -634,8 +599,7 @@ int lprocfs_exp_setup(struct obd_export *exp, struct lnet_nid *nid)
 	int rc = 0;
 
 	ENTRY;
-	if (!exp || !exp->exp_obd || !exp->exp_obd->obd_debugfs_exports ||
-	    !exp->exp_obd->obd_nid_stats_hash)
+	if (!exp || !exp->exp_obd || !exp->exp_obd->obd_debugfs_exports)
 		RETURN(-EINVAL);
 
 	/* not test against zero because eric say:
@@ -655,8 +619,6 @@ int lprocfs_exp_setup(struct obd_export *exp, struct lnet_nid *nid)
 
 	obd = exp->exp_obd;
 
-	CDEBUG(D_CONFIG, "using hash %p\n", obd->obd_nid_stats_hash);
-
 	OBD_ALLOC_PTR(new_stat);
 	if (new_stat == NULL)
 		RETURN(-ENOMEM);
@@ -666,9 +628,13 @@ int lprocfs_exp_setup(struct obd_export *exp, struct lnet_nid *nid)
 	/* we need set default refcount to 1 to balance obd_disconnect */
 	atomic_set(&new_stat->nid_exp_ref_count, 1);
 
-	old_stat = cfs_hash_findadd_unique(obd->obd_nid_stats_hash,
-					   &new_stat->nid,
-					   &new_stat->nid_hash);
+	old_stat = obd_nid_stats_get(obd, new_stat);
+	/* old_stat ERR pointer means we failed to add new_stat
+	 * to the hash
+	 */
+	if (IS_ERR(old_stat))
+		GOTO(destroy_new, rc = PTR_ERR(old_stat));
+
 	CDEBUG(D_INFO, "Found stats %p for nid %s - ref %d\n",
 	       old_stat, nidstr, atomic_read(&old_stat->nid_exp_ref_count));
 
@@ -788,6 +754,7 @@ static void display_brw_stats(struct seq_file *seq, const char *name,
 	}
 }
 
+static const char disk_inflight_io_name[] = "disk I/Os in flight";
 static const struct brw_stats_props brw_props[] = {
 	{ .bsp_name	= "pages per bulk r/w",
 	  .bsp_units	= "rpcs",
@@ -801,9 +768,9 @@ static const struct brw_stats_props brw_props[] = {
 	{ .bsp_name	= "disk fragmented I/Os",
 	  .bsp_units	= "ios",
 	  .bsp_scale	= false				},
-	{ .bsp_name	= "disk I/Os in flight",
+	{ .bsp_name	= disk_inflight_io_name,
 	  .bsp_units	= "ios",
-	  .bsp_scale	= false				},
+	  .bsp_scale	= false                         },
 	{ .bsp_name	= "I/O time (1/1000s)",
 	  .bsp_units	= "ios",
 	  .bsp_scale	= true				},
@@ -825,14 +792,21 @@ static int brw_stats_seq_show(struct seq_file *seq, void *v)
 			     ":", true, "");
 
 	for (i = 0; i < ARRAY_SIZE(brw_stats->bs_props); i++) {
+		bool scale = brw_stats->bs_props[i].bsp_scale;
+
 		if (!brw_stats->bs_props[i].bsp_name)
 			continue;
+
+		if (!strcmp(brw_stats->bs_props[i].bsp_name,
+			    disk_inflight_io_name)) {
+			scale = brw_stats->bs_inflight_io_log2;
+		}
 
 		display_brw_stats(seq, brw_stats->bs_props[i].bsp_name,
 				  brw_stats->bs_props[i].bsp_units,
 				  &brw_stats->bs_hist[i * 2],
 				  &brw_stats->bs_hist[i * 2 + 1],
-				  brw_stats->bs_props[i].bsp_scale);
+				  scale);
 	}
 
 	return 0;
@@ -852,29 +826,159 @@ static ssize_t brw_stats_seq_write(struct file *file,
 
 	return len;
 }
-
 LDEBUGFS_SEQ_FOPS(brw_stats);
 
-int lprocfs_init_brw_stats(struct brw_stats *brw_stats)
+static int io_latency_stats_seq_show(struct seq_file *seq, void *v)
 {
-	int i, result;
+	struct brw_stats *bs = seq->private;
+	int num_buckets = IO_LATENCY_BUCKETS;
+	struct obd_hist_pcpu *h;
+	bool hdr_printed;
+	int i, j, kb;
 
+	seq_puts(seq, "io_latency_by_size:\n");
+	spin_lock(&bs->bs_loi_list_lock);
+	lprocfs_stats_header(seq, ktime_get_real(),
+			     bs->bs_io_latency_init, 15, ":", false, "");
+
+	/* Print read latency histograms */
+	for (i = 0, kb = PAGE_SIZE / 1024; i < num_buckets; i++, kb <<= 1) {
+		u64 r;
+
+		h = &bs->bs_read_io_latency_by_size[i];
+		if (unlikely(!h->oh_initialized)) {
+			seq_printf(seq, "rd_%uK: { uninit }\n", kb);
+			continue;
+		}
+
+		hdr_printed = false;
+		for (j = 0; j < OBD_HIST_MAX; j++) {
+			r = percpu_counter_sum(&h->oh_pc_buckets[j]);
+			if (r == 0)
+				continue;
+
+			if (!hdr_printed) {
+				seq_printf(seq, "rd_%uK: { ", kb);
+				hdr_printed = true;
+			}
+			seq_printf(seq, "%dus: %llu, ",
+				   (j == 0) ? 0 : 1 << (j - 1),
+				   binary_usec_to_dec(r));
+		}
+		if (hdr_printed)
+			seq_puts(seq, "}\n");
+	}
+
+	/* Print write latency histograms */
+	for (i = 0, kb = PAGE_SIZE / 1024; i < num_buckets; i++, kb <<= 1) {
+		u64 w;
+
+		h = &bs->bs_write_io_latency_by_size[i];
+		if (unlikely(!h->oh_initialized)) {
+			seq_printf(seq, "wr_%uK: { uninit }\n", kb);
+			continue;
+		}
+
+		hdr_printed = false;
+		for (j = 0; j < OBD_HIST_MAX; j++) {
+
+			w = percpu_counter_sum(&h->oh_pc_buckets[j]);
+			if (w == 0)
+				continue;
+
+			if (!hdr_printed) {
+				seq_printf(seq, "wr_%uK: { ", kb);
+				hdr_printed = true;
+			}
+			seq_printf(seq, "%dus: %llu, ",
+				   (j == 0) ? 0 : 1 << (j - 1),
+				   binary_usec_to_dec(w));
+		}
+		if (hdr_printed)
+			seq_puts(seq, "}\n");
+	}
+
+	spin_unlock(&bs->bs_loi_list_lock);
+
+	return 0;
+}
+
+static ssize_t io_latency_stats_seq_write(struct file *file,
+					  const char __user *buf,
+					  size_t len, loff_t *off)
+{
+	struct seq_file *seq = file->private_data;
+	struct brw_stats *bs = seq->private;
+	int i;
+
+	spin_lock(&bs->bs_loi_list_lock);
+	bs->bs_io_latency_init = ktime_get_real();
+	for (i = 0; i < IO_LATENCY_BUCKETS; i++) {
+		if (likely(bs->bs_read_io_latency_by_size[i].oh_initialized))
+			lprocfs_oh_clear_pcpu(&bs->bs_read_io_latency_by_size[i]);
+	}
+
+	for (i = 0; i < IO_LATENCY_BUCKETS; i++) {
+		if (likely(bs->bs_write_io_latency_by_size[i].oh_initialized))
+			lprocfs_oh_clear_pcpu(&bs->bs_write_io_latency_by_size[i]);
+	}
+	spin_unlock(&bs->bs_loi_list_lock);
+
+	return len;
+}
+LDEBUGFS_SEQ_FOPS(io_latency_stats);
+
+int lprocfs_init_brw_stats(struct brw_stats *bs)
+{
+	int i, rc;
+
+	bs->bs_init = ktime_get_real();
 	for (i = 0; i < BRW_RW_STATS_NUM; i++) {
-		result = lprocfs_oh_alloc_pcpu(&brw_stats->bs_hist[i]);
-		if (result)
+		rc = lprocfs_oh_alloc_pcpu(&bs->bs_hist[i]);
+		if (rc)
 			break;
 	}
 
-	return result;
+	spin_lock_init(&bs->bs_loi_list_lock);
+
+	/* verify IO_LATENCY_BUCKETS is large enough for all RPCs */
+	BUILD_BUG_ON(IO_LATENCY_BUCKETS < PTLRPC_MAX_BRW_BITS - PAGE_SHIFT);
+
+	/* initialize RPC latency by size histograms */
+	bs->bs_io_latency_init = ktime_get_real();
+	for (i = 0; i < IO_LATENCY_BUCKETS; i++) {
+		rc = lprocfs_oh_alloc_pcpu(&bs->bs_read_io_latency_by_size[i]);
+		if (rc) {
+			CWARN("%s: can't init read pcpu stats idx = %u\n",
+			      bs->bs_devname, i);
+			break;
+		}
+	}
+
+	for (i = 0; i < IO_LATENCY_BUCKETS; i++) {
+		rc = lprocfs_oh_alloc_pcpu(&bs->bs_write_io_latency_by_size[i]);
+		if (rc) {
+			CWARN("%s: can't init write pcpu stats idx = %u\n",
+			      bs->bs_devname, i);
+			break;
+		}
+	}
+
+	return rc;
 }
 EXPORT_SYMBOL(lprocfs_init_brw_stats);
 
-void lprocfs_fini_brw_stats(struct brw_stats *brw_stats)
+void lprocfs_fini_brw_stats(struct brw_stats *bs)
 {
 	int i;
 
 	for (i = 0; i < BRW_RW_STATS_NUM; i++)
-		lprocfs_oh_release_pcpu(&brw_stats->bs_hist[i]);
+		lprocfs_oh_release_pcpu(&bs->bs_hist[i]);
+
+	for (i = 0; i < IO_LATENCY_BUCKETS; i++) {
+		lprocfs_oh_release_pcpu(&bs->bs_read_io_latency_by_size[i]);
+		lprocfs_oh_release_pcpu(&bs->bs_write_io_latency_by_size[i]);
+	}
 }
 EXPORT_SYMBOL(lprocfs_fini_brw_stats);
 
@@ -884,7 +988,6 @@ void ldebugfs_register_brw_stats(struct dentry *parent,
 	int i;
 
 	LASSERT(brw_stats);
-	brw_stats->bs_init = ktime_get_real();
 	for (i = 0; i < BRW_RW_STATS_NUM; i++) {
 		struct brw_stats_props *props = brw_stats->bs_props;
 
@@ -903,6 +1006,17 @@ void ldebugfs_register_brw_stats(struct dentry *parent,
 }
 EXPORT_SYMBOL(ldebugfs_register_brw_stats);
 
+void ldebugfs_register_io_latency_stats(struct dentry *parent,
+					struct brw_stats *brw_stats)
+{
+	if (!parent)
+		return;
+
+	debugfs_create_file("io_latency_stats", 0644, parent, brw_stats,
+			    &io_latency_stats_fops);
+}
+EXPORT_SYMBOL(ldebugfs_register_io_latency_stats);
+
 int lprocfs_hash_seq_show(struct seq_file *m, void *data)
 {
 	struct obd_device *obd = m->private;
@@ -915,9 +1029,8 @@ int lprocfs_hash_seq_show(struct seq_file *m, void *data)
 		   HASH_NAME_LEN, "name");
 	ldebugfs_rhash_seq_show("UUID_HASH", &obd->obd_uuid_hash, m);
 	ldebugfs_rhash_seq_show("NID_HASH", &obd->obd_nid_hash.ht, m);
+	ldebugfs_rhash_seq_show("NID_STATS", &obd->obd_nid_stats_hash.ht, m);
 
-	cfs_hash_debug_header(m);
-	cfs_hash_debug_str(obd->obd_nid_stats_hash, m);
 	return 0;
 }
 EXPORT_SYMBOL(lprocfs_hash_seq_show);

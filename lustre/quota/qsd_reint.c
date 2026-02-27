@@ -29,10 +29,12 @@ static void qsd_reint_completion(const struct lu_env *env,
 {
 	struct qsd_instance	*qsd = qqi->qqi_qsd;
 	__u64			*slv_ver = (__u64 *)arg;
+	struct obd_import	*imp = class_exp2cliimp(qsd->qsd_exp);
 	ENTRY;
 
 	if (rc) {
-		CDEBUG_LIMIT(rc != -EAGAIN ? D_ERROR : D_QUOTA,
+		CDEBUG_LIMIT((imp->imp_state != LUSTRE_IMP_FULL ||
+			      rc == -EAGAIN) ? D_QUOTA : D_ERROR,
 			     "%s: failed to enqueue global quota lock, glb fid:"
 			     DFID", rc:%d\n", qsd->qsd_svname,
 			     PFID(&req_qbody->qb_fid), rc);
@@ -436,7 +438,10 @@ static int qsd_reint_main(void *_args)
 		GOTO(out_env_init, rc = 0);
 
 	LASSERT(qsd->qsd_exp != NULL);
-	LASSERT(qqi->qqi_glb_uptodate == 0 || qqi->qqi_slv_uptodate == 0);
+
+	/* Has qsd_process_upd already updated the index? */
+	if (qqi->qqi_glb_uptodate != 0 && qqi->qqi_slv_uptodate != 0)
+		GOTO(out_env_init,  rc = 0);
 
 	memset(&qti->qti_lvb, 0, sizeof(qti->qti_lvb));
 

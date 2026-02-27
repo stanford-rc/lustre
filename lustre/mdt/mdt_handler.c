@@ -49,7 +49,7 @@
 
 #if OBD_OCD_VERSION(3, 0, 53, 0) > LUSTRE_VERSION_CODE
 static int mdt_max_mod_rpcs_per_client_set(const char *val,
-				cfs_kernel_param_arg_t *kp)
+				const struct kernel_param *kp)
 {
 	unsigned int num;
 	int rc;
@@ -1081,16 +1081,16 @@ int __mdt_stripe_get(struct mdt_thread_info *info, struct mdt_object *o,
 
 got:
 		if (strcmp(name, XATTR_NAME_LOV) == 0) {
+			if (info->mti_big_lov_used) {
+				LASSERT(info->mti_big_lovsize >= rc);
+				ma->ma_lmm = info->mti_big_lov;
+			}
 			/* NOT return LOV EA with hole to old client. */
 			if (unlikely(le32_to_cpu(ma->ma_lmm->lmm_pattern) &
 				     LOV_PATTERN_F_HOLE) &&
 			    !(exp_connect_flags(info->mti_exp) &
 			      OBD_CONNECT_LFSCK)) {
 				return -EIO;
-			}
-			if (info->mti_big_lov_used) {
-				LASSERT(info->mti_big_lovsize >= rc);
-				ma->ma_lmm = info->mti_big_lov;
 			}
 			ma->ma_lmm_size = rc;
 			ma->ma_valid |= MA_LOV;
@@ -3082,8 +3082,6 @@ int mdt_object_striped(struct mdt_thread_info *mti, struct mdt_object *obj)
 	return (rc > 0) ? 1 : (rc == -ENODATA) ? 0 : rc;
 }
 
-#define DIR_READ_ON_OPEN_PAGES 1
-
 static int mdt_dir_read_on_open(struct mdt_thread_info	*info,
 				struct lustre_handle *lhc)
 {
@@ -3123,15 +3121,13 @@ static int mdt_dir_read_on_open(struct mdt_thread_info	*info,
 	rdpg->rp_attrs = LUDA_FID | LUDA_TYPE;
 	if (exp_connect_flags(info->mti_exp) & OBD_CONNECT_64BITHASH)
 		rdpg->rp_attrs |= LUDA_64BITHASH;
-	rdpg->rp_count  = min_t(unsigned int, req->rq_reqmsg->lm_repsize,
-			    DIR_READ_ON_OPEN_PAGES << PAGE_SHIFT);
+	rdpg->rp_count  = req->rq_reqmsg->lm_repsize;
 	rdpg->rp_npages = 0;
 
 	rc = req_capsule_server_grow(pill, &RMF_NIOBUF_INLINE, rdpg->rp_count);
-	if (rc != 0) {
+	if (rc != 0)
 		/* failed to grow data buffer, just exit */
 		GOTO(out_err, rc = -E2BIG);
-	}
 
 	/* re-take MDT_BODY and NIOBUF_INLINE buffers after the buffer grow */
 	mbo = req_capsule_server_get(pill, &RMF_MDT_BODY);
@@ -3160,6 +3156,8 @@ out_put:
 out_rnb:
 	if (rc < 0)
 		req_capsule_shrink(pill, &RMF_NIOBUF_INLINE, 0, RCL_SERVER);
+	else
+		req_capsule_shrink(pill, &RMF_NIOBUF_INLINE, rc, RCL_SERVER);
 out_err:
 	if (rc)
 		CDEBUG(D_INFO, "read dir on open failed with rc = %d\n", rc);
@@ -3364,6 +3362,7 @@ int mdt_device_sync(const struct lu_env *env, struct mdt_device *mdt)
 	int rc;
 
 	ENTRY;
+	lu_objects_destroy_delayed();
 
 	rc = dt->dd_ops->dt_sync(env, dt);
 	RETURN(rc);
@@ -7170,8 +7169,15 @@ static int mdt_connect_internal(const struct lu_env *env,
 	    !(data->ocd_connect_flags & OBD_CONNECT_RDONLY))
 		RETURN(-EACCES);
 
-	if (data->ocd_connect_flags & OBD_CONNECT_FLAGS2)
-		data->ocd_connect_flags2 &= MDT_CONNECT_SUPPORTED2;
+	if (data->ocd_connect_flags & OBD_CONNECT_FLAGS2) {
+		__u64 supported2 = MDT_CONNECT_SUPPORTED2;
+
+		/* Add FLR_EC to supported flags when enabled */
+		if (mdt_enable_flr_ec)
+			supported2 |= OBD_CONNECT2_FLR_EC;
+
+		data->ocd_connect_flags2 &= supported2;
+	}
 
 	data->ocd_ibits_known &= MDS_INODELOCK_FULL;
 
@@ -7474,11 +7480,13 @@ static int mdt_obd_connect(const struct lu_env *env,
 			   struct obd_connect_data *data,
 			   void *localdata)
 {
-	struct obd_export	*lexp;
-	struct lustre_handle	conn = { 0 };
-	struct mdt_device	*mdt;
-	int			 rc;
-	struct lnet_nid		*client_nid = localdata;
+	struct ptlrpc_request *req = localdata;
+	struct ptlrpc_svc_ctx *svc_ctx = NULL;
+	struct lnet_nid *client_nid = NULL;
+	struct lustre_handle conn = { 0 };
+	struct obd_export *lexp;
+	struct mdt_device *mdt;
+	int rc;
 
 	ENTRY;
 
@@ -7513,9 +7521,20 @@ static int mdt_obd_connect(const struct lu_env *env,
 	lexp = class_conn2export(&conn);
 	LASSERT(lexp != NULL);
 
-	rc = nodemap_add_member(client_nid, lexp);
-	if (rc != 0 && rc != -EEXIST)
-		GOTO(out, rc);
+	if (req) {
+		svc_ctx = req->rq_svc_ctx;
+		client_nid = &req->rq_peer.nid;
+	}
+
+	if (svc_ctx || client_nid) {
+		rc = nodemap_add_member(svc_ctx, client_nid, lexp);
+		if (rc != 0 && rc != -EEXIST)
+			GOTO(out, rc);
+	} else {
+		CDEBUG(D_HA,
+		       "%s: cannot find nodemap for client %s: svc_ctx and nid are null\n",
+		       obd->obd_name, cluuid->uuid);
+	}
 
 	rc = mdt_connect_internal(env, lexp, mdt, data, false);
 	if (rc == 0) {
@@ -7524,8 +7543,8 @@ static int mdt_obd_connect(const struct lu_env *env,
 		LASSERT(lcd);
 		memcpy(lcd->lcd_uuid, cluuid, sizeof(lcd->lcd_uuid));
 		rc = tgt_client_new(env, lexp);
-		if (rc == 0)
-			mdt_export_stats_init(obd, lexp, localdata);
+		if (rc == 0 && client_nid)
+			mdt_export_stats_init(obd, lexp, client_nid);
 	}
 out:
 	if (rc != 0) {
@@ -7545,24 +7564,39 @@ static int mdt_obd_reconnect(const struct lu_env *env,
 			     struct obd_connect_data *data,
 			     void *localdata)
 {
-	struct lnet_nid *client_nid = localdata;
+	struct ptlrpc_request *req = localdata;
+	struct ptlrpc_svc_ctx *svc_ctx = NULL;
+	struct lnet_nid *client_nid = NULL;
 	int rc;
 
 	ENTRY;
 
-	if (exp == NULL || obd == NULL || cluuid == NULL)
+	if (!exp || !obd || !cluuid)
 		RETURN(-EINVAL);
 
-	rc = nodemap_add_member(client_nid, exp);
-	if (rc != 0 && rc != -EEXIST)
-		RETURN(rc);
+	if (req) {
+		svc_ctx = req->rq_svc_ctx;
+		client_nid = &req->rq_peer.nid;
+	}
+
+	if (svc_ctx || client_nid) {
+		rc = nodemap_add_member(svc_ctx, client_nid, exp);
+		if (rc != 0 && rc != -EEXIST)
+			RETURN(rc);
+	} else {
+		CDEBUG(D_HA,
+		       "%s: cannot find nodemap for client %s: svc_ctx and nid are null\n",
+		       obd->obd_name, cluuid->uuid);
+	}
 
 	rc = mdt_connect_internal(env, exp, mdt_dev(obd->obd_lu_dev), data,
 				  true);
-	if (rc == 0)
-		mdt_export_stats_init(obd, exp, localdata);
-	else
+	if (rc == 0) {
+		if (client_nid)
+			mdt_export_stats_init(obd, exp, client_nid);
+	} else {
 		nodemap_del_member(exp);
+	}
 
 	RETURN(rc);
 }
@@ -8150,7 +8184,7 @@ static int mdt_iocontrol(unsigned int cmd, struct obd_export *exp, int len,
 		rc = mdt_device_sync(&env, mdt);
 		GOTO(out, rc);
 	case OBD_IOC_SET_READONLY:
-		rc = dt_sync(&env, dt);
+		rc = mdt_device_sync(&env, mdt);
 		if (rc == 0)
 			rc = dt_ro(&env, dt);
 		GOTO(out, rc);

@@ -93,21 +93,16 @@ static void ll_invalidate_folio(struct folio *folio, size_t offset, size_t len)
  * as a result of explicit truncate, or when inode is removed from memory
  * (as a result of final iput(), umount, or memory pressure induced icache
  * shrinking).
- *
  * @vmpage: pointer to struct page (single page)
  * @offset: Starting offset in bytes
+ * @length: Length to release
  *
  * [0, offset] bytes of the page remain valid (this is for a case of not-page
  * aligned truncate). Lustre leaves partially truncated page in the cache,
  * relying on struct inode::i_size to limit further accesses.
  */
 static void ll_invalidatepage(struct page *vmpage,
-#ifdef HAVE_INVALIDATE_RANGE
-				unsigned int offset, unsigned int length
-#else
-				unsigned long offset
-#endif
-			     )
+			      unsigned int offset, unsigned int length)
 {
 	struct inode     *inode;
 	struct lu_env    *env;
@@ -122,11 +117,7 @@ static void ll_invalidatepage(struct page *vmpage,
 	 * below because they are run with page locked and all our io is
 	 * happening with locked page too
 	 */
-#ifdef HAVE_INVALIDATE_RANGE
 	if (offset == 0 && length == PAGE_SIZE) {
-#else
-	if (offset == 0) {
-#endif
 		/* See the comment in ll_releasepage() */
 		env = cl_env_percpu_get();
 		LASSERT(!IS_ERR(env));
@@ -465,9 +456,14 @@ ll_direct_IO_impl(struct kiocb *iocb, struct iov_iter *iter, int rw)
 
 	/* the requirement to not return EIOCBQUEUED for pipes (see bottom of
 	 * this function) plays havoc with the unaligned I/O lifecycle, so
-	 * don't allow unaligned I/O on pipes
+	 * don't allow unaligned I/O on pipes.
+	 *
+	 * Additionally, pipe iterators don't have user pages that can be
+	 * pinned for DIO - iov_iter_get_pages_alloc2() will fail or return 0
+	 * for pipes, so reject all pipe iterators for DIO and fall back to
+	 * buffered I/O.
 	 */
-	if (unaligned && iov_iter_is_pipe(iter))
+	if (iov_iter_is_pipe(iter))
 		RETURN(0);
 
 	/* returning 0 here forces the remaining I/O through buffered I/O
@@ -805,7 +801,8 @@ again:
 		goto again;
 	}
 
-	page = cl_page_find(env, clob, vmpage->index, vmpage, CPT_CACHEABLE);
+	page = cl_page_find(env, clob, folio_index_page(vmpage), vmpage,
+			    CPT_CACHEABLE);
 	if (IS_ERR(page))
 		GOTO(out, result = PTR_ERR(page));
 
@@ -1022,7 +1019,9 @@ const struct address_space_operations ll_aops = {
 	.releasepage		= (void *)ll_releasepage,
 #endif
 	.direct_IO		= ll_direct_IO,
+#ifndef HAVE_FILEMAP_GET_FOLIOS
 	.writepage		= ll_writepage,
+#endif
 	.writepages		= ll_writepages,
 	.write_begin		= ll_write_begin,
 	.write_end		= ll_write_end,

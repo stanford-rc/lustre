@@ -205,6 +205,49 @@ static int nodemap_init_hash(struct nodemap_config *nmc)
 	return 0;
 }
 
+static u32 nodemap_sha_hashfn(const void *data, u32 len, u32 seed)
+{
+	const u64 *chunks = (const u64 *)data;
+	int i;
+
+	/* Combine the hash of each 64-bit chunk */
+	for (i = 0; i < SHA256_DIGEST_SIZE / sizeof(u64); i++)
+		seed ^= hash_64(chunks[i], 32);
+
+	return seed;
+}
+
+static int nodemap_sha_cmpfn(struct rhashtable_compare_arg *arg,
+			     const void *obj)
+{
+	const struct lu_nodemap *nm = obj;
+	const char *sha = arg->key;
+
+	return memcmp(sha, nm->nm_sha, SHA256_DIGEST_SIZE);
+}
+
+static const struct rhashtable_params nodemap_sha_hash_params = {
+	.key_len        = SHA256_DIGEST_SIZE,
+	.key_offset	= offsetof(struct lu_nodemap, nm_sha),
+	.head_offset	= offsetof(struct lu_nodemap, nm_sha_hash),
+	.hashfn		= nodemap_sha_hashfn,
+	.obj_cmpfn	= nodemap_sha_cmpfn,
+};
+
+/**
+ * nodemap_init_sha_hash() - Initialize nodemap_sha_hash
+ * @nmc: nodemap_config struct for which sha hash is getting initialized
+ *
+ * Return:
+ * * %0		success
+ * * %-ENOMEM		cannot create hash
+ */
+static int nodemap_init_sha_hash(struct nodemap_config *nmc)
+{
+	return rhashtable_init(&nmc->nmc_nodemap_sha_hash,
+			       &nodemap_sha_hash_params);
+}
+
 /**
  * allow_op_on_nm() - Check for valid modification of nodemap
  * @nodemap: the nodemap to modify
@@ -330,18 +373,18 @@ static bool nodemap_name_is_valid(const char *name)
 }
 
 /**
- * nodemap_lookup() - Nodemap lookup
+ * nodemap_lookup_locked() - Nodemap lookup
  * @name: name of nodemap
  *
- * Look nodemap up in the active_config nodemap hash. Caller should hold the
- * active_config_lock.
+ * Look nodemap up in the active_config nodemap hash.
+ * Caller must hold the active_config_lock.
  *
  * Return:
  * * %nodemap		pointer set to found nodemap
  * * %-EINVAL		name is not valid
  * * %-ENOENT		nodemap not found
  */
-struct lu_nodemap *nodemap_lookup(const char *name)
+struct lu_nodemap *nodemap_lookup_locked(const char *name)
 {
 	struct lu_nodemap *nodemap = NULL;
 
@@ -353,6 +396,71 @@ struct lu_nodemap *nodemap_lookup(const char *name)
 		return ERR_PTR(-ENOENT);
 
 	return nodemap;
+}
+
+/**
+ * nodemap_lookup_unlocked - look up nodemap without active_config_lock.
+ * @name: name of the nodemap
+ *
+ * Look up the nodemap in the active_config nodemap hash without requiring
+ * the caller to lock/unlock active_config_lock itself.
+ *
+ * Return: pointer to the found nodemap on success;
+ * * %ERR_PTR(-EINVAL) if @name is invalid;
+ * * %ERR_PTR(-ENOENT) if no nodemap with that name exists.
+ */
+struct lu_nodemap *nodemap_lookup_unlocked(const char *name)
+{
+	struct lu_nodemap *nodemap;
+
+	mutex_lock(&active_config_lock);
+	nodemap = nodemap_lookup_locked(name);
+	mutex_unlock(&active_config_lock);
+
+	return nodemap;
+}
+
+/**
+ * nodemap_lookup_sha() - Nodemap lookup by sha of nodemap name
+ * @sha: sha of nodemap name
+ * @name_buf: buffer to write the nodemap name to
+ * @name_bufsz: length of buffer
+ *
+ * Look nodemap up in the active_config nodemap sha hash, and return its name.
+ * Only nodemaps with the gssonly_identification property set can be looked up
+ * like that.
+ *
+ * Return:
+ * * %-EINVAL		buffer for nodemap name is too small
+ * * %-EPERM		nodemap does not have gssonly_identification property
+ * * %-ENOENT		nodemap not found
+ * * %0			success
+ */
+int nodemap_lookup_sha(const char *sha, char *name_buf, size_t name_bufsz)
+{
+	struct lu_nodemap *nodemap;
+	int rc = 0;
+
+	if (name_bufsz <= LUSTRE_NODEMAP_NAME_LENGTH)
+		return -EINVAL;
+
+	mutex_lock(&active_config_lock);
+	nodemap = rhashtable_lookup_fast(&active_config->nmc_nodemap_sha_hash,
+					 sha, nodemap_sha_hash_params);
+	mutex_unlock(&active_config_lock);
+
+	if (!nodemap)
+		return -ENOENT;
+
+	nodemap_getref(nodemap);
+	if (!nodemap->nmf_gss_identify)
+		GOTO(out, rc = -EPERM);
+
+	strscpy(name_buf, nodemap->nm_name, name_bufsz);
+
+out:
+	nodemap_putref(nodemap);
+	return rc;
 }
 
 /**
@@ -571,53 +679,98 @@ EXPORT_SYMBOL(nodemap_parse_idmap);
 
 /**
  * nodemap_add_member() - add a member to a nodemap
+ * @svc_ctx: security context
  * @nid: nid to add to the members
  * @exp: obd_export structure for the connection that is being added
  *
+ * Add a member export to a nodemap.
+ * First we try to find the nodemap based on the name provided in the security
+ * context. Only nodemaps with the gssony_identification property set can be
+ * selected this way, otherwise we return -EPERM.
+ * If the security context does not provide any nodemap name, we try to find the
+ * nodemap based on the provided client nid.
+ *
  * Return:
- * * %-EINVAL		export is NULL, or has invalid NID
+ * * %-EINVAL		export is NULL, or name is invalid, or NID is invalid
+ * * %-ENOENT		nodemap not found
+ * * %-EPERM		nodemap does not have gssonly_identification property
  * * %-EEXIST		export is already member of a nodemap
  */
-int nodemap_add_member(struct lnet_nid *nid, struct obd_export *exp)
+int nodemap_add_member(struct ptlrpc_svc_ctx *svc_ctx, struct lnet_nid *nid,
+		       struct obd_export *exp)
 {
 	struct lu_nodemap *nodemap;
-	bool banned;
-	int rc = 0;
+	bool banned = false;
+	char *name = NULL;
+	int rc;
 
 	ENTRY;
-	mutex_lock(&active_config_lock);
-	down_read(&active_config->nmc_range_tree_lock);
-	down_read(&active_config->nmc_ban_range_tree_lock);
 
-	nodemap = nodemap_classify_nid(nid, &banned);
-	if (IS_ERR(nodemap)) {
-		rc = PTR_ERR(nodemap);
-		LCONSOLE_WARN(
-			"%s: error adding %s to nodemap, no valid NIDs found: rc=%d\n",
-			exp->exp_obd->obd_name, libcfs_nidstr(nid), rc);
+	if (svc_ctx)
+		name = svc_ctx->sc_nodemap;
+
+	mutex_lock(&active_config_lock);
+	if (name) {
+		struct lu_nid_range *range;
+
+		nodemap = nodemap_lookup(name);
+		if (IS_ERR(nodemap)) {
+			rc = PTR_ERR(nodemap);
+			CWARN("%s: error adding to nodemap %s not found: rc = %d\n",
+			      exp->exp_obd->obd_name, name, rc);
+			mutex_unlock(&active_config_lock);
+			GOTO(out, rc);
+		}
+		if (!nodemap->nmf_gss_identify) {
+			rc = -EPERM;
+			CWARN("%s: error adding to nodemap %s, gssonly_identification not set: rc = %d\n",
+			      exp->exp_obd->obd_name, name, rc);
+			GOTO(out_unlock, rc);
+		}
+		down_read(&active_config->nmc_ban_range_tree_lock);
+		range = ban_range_search(active_config, nid);
+		up_read(&active_config->nmc_ban_range_tree_lock);
+		if (range && range->rn_nodemap == nodemap)
+			banned = true;
+	} else if (nid) {
+		down_read(&active_config->nmc_range_tree_lock);
+		down_read(&active_config->nmc_ban_range_tree_lock);
+		nodemap = nodemap_classify_nid(nid, &banned);
+		up_read(&active_config->nmc_range_tree_lock);
+		up_read(&active_config->nmc_ban_range_tree_lock);
+		if (IS_ERR(nodemap)) {
+			rc = PTR_ERR(nodemap);
+			CWARN("%s: error adding to nodemap, no valid NIDs found: rc = %d\n",
+			      exp->exp_obd->obd_name, rc);
+			mutex_unlock(&active_config_lock);
+			GOTO(out, rc);
+		}
 	} else {
-		rc = nm_member_add(nodemap, exp);
-		exp->exp_banned = banned;
-		if (banned)
-			LCONSOLE_WARN("%s: adding %sNID %s to nodemap %s\n",
-				      exp->exp_obd->obd_name,
-				      banned ? "banned " : "",
-				      libcfs_nidstr(nid),
-				      nodemap->nm_name);
-		else
-			CDEBUG(D_SEC, "%s: adding %sNID %s to nodemap %s\n",
-			       exp->exp_obd->obd_name, banned ? "banned " : "",
-			       libcfs_nidstr(nid),
-			       nodemap->nm_name);
+		rc = -EINVAL;
+		CWARN("%s: error adding to nodemap, no valid svc ctx or NID provided: rc = %d\n",
+		      exp->exp_obd->obd_name, rc);
+		mutex_unlock(&active_config_lock);
+		GOTO(out, rc);
 	}
 
-	up_read(&active_config->nmc_range_tree_lock);
-	up_read(&active_config->nmc_ban_range_tree_lock);
+	rc = nm_member_add(nodemap, exp);
+	exp->exp_banned = banned;
+	if (banned)
+		LCONSOLE_WARN("%s: adding %sNID %s to nodemap %s\n",
+			      exp->exp_obd->obd_name,
+			      banned ? "banned " : "",
+			      libcfs_nidstr(nid),
+			      nodemap->nm_name);
+	else
+		CDEBUG(D_SEC, "%s: adding %sNID %s to nodemap %s\n",
+		       exp->exp_obd->obd_name, banned ? "banned " : "",
+		       libcfs_nidstr(nid),
+		       nodemap->nm_name);
+
+out_unlock:
 	mutex_unlock(&active_config_lock);
-
-	if (!IS_ERR(nodemap))
-		nodemap_putref(nodemap);
-
+	nodemap_putref(nodemap);
+out:
 	RETURN(rc);
 }
 EXPORT_SYMBOL(nodemap_add_member);
@@ -741,7 +894,7 @@ int nodemap_add_idmap(const char *nodemap_name, enum nodemap_id_type id_type,
 	ENTRY;
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
+	nodemap = nodemap_lookup_locked(nodemap_name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = PTR_ERR(nodemap));
@@ -789,7 +942,7 @@ int nodemap_del_idmap(const char *nodemap_name, enum nodemap_id_type id_type,
 	ENTRY;
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
+	nodemap = nodemap_lookup_locked(nodemap_name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = PTR_ERR(nodemap));
@@ -883,7 +1036,7 @@ struct lu_nodemap *nodemap_get_from_exp(struct obd_export *exp)
 EXPORT_SYMBOL(nodemap_get_from_exp);
 
 /**
- * nodemap_map_id() - mapping function for nodemap idmaps
+ * __nodemap_map_id() - mapping function for nodemap idmaps
  * @nodemap: lu_nodemap structure defining nodemap
  * @id_type: NODEMAP_UID or NODEMAP_GID or NODEMAP_PROJID
  * @tree_type: NODEMAP_CLIENT_TO_FS or NODEMAP_FS_TO_CLIENT
@@ -1223,6 +1376,7 @@ static int nodemap_inherit_properties(struct lu_nodemap *dst,
 		dst->nmf_fileset_use_iam = 1;
 		dst->nmf_raise_privs = NODEMAP_RAISE_PRIV_NONE;
 		dst->nmf_rbac_raise = NODEMAP_RBAC_NONE;
+		dst->nmf_gss_identify = 0;
 
 		dst->nm_squash_uid = NODEMAP_NOBODY_UID;
 		dst->nm_squash_gid = NODEMAP_NOBODY_GID;
@@ -1250,6 +1404,7 @@ static int nodemap_inherit_properties(struct lu_nodemap *dst,
 		dst->nmf_fileset_use_iam = 1;
 		dst->nmf_raise_privs = src->nmf_raise_privs;
 		dst->nmf_rbac_raise = src->nmf_rbac_raise;
+		dst->nmf_gss_identify = src->nmf_gss_identify;
 		dst->nm_squash_uid = src->nm_squash_uid;
 		dst->nm_squash_gid = src->nm_squash_gid;
 		dst->nm_squash_projid = src->nm_squash_projid;
@@ -1414,7 +1569,7 @@ int nodemap_add_range(const char *name, const struct lnet_nid nid[2],
 	int			 rc;
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
+	nodemap = nodemap_lookup_locked(name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = PTR_ERR(nodemap));
@@ -1425,6 +1580,13 @@ int nodemap_add_range(const char *name, const struct lnet_nid nid[2],
 
 	if (!allow_op_on_nm(nodemap))
 		GOTO(out_unlock, rc = -ENXIO);
+
+	if (nodemap->nmf_gss_identify) {
+		CDEBUG(D_INFO,
+		       "cannot add any NID range on nodemap %s because 'gssonly_identification' property is set\n",
+		       nodemap->nm_name);
+		GOTO(out_unlock, rc = -EPERM);
+	}
 
 	rc = nodemap_add_range_helper(active_config, nodemap, nid,
 				      netmask, 0);
@@ -1458,7 +1620,7 @@ int nodemap_del_range(const char *name, const struct lnet_nid nid[2],
 	int rc = 0;
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
+	nodemap = nodemap_lookup_locked(name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = PTR_ERR(nodemap));
@@ -1553,12 +1715,13 @@ int nodemap_add_ban_range_helper(struct nodemap_config *config,
 
 	/* Find out if range to be added to ban list is included in
 	 * regular NID ranges for this nodemap.
-	 * If nodemap is default, the ban range must not be included totally or
+	 * If nodemap is default or has gss identification enabled,
+	 * the ban range must not be included totally or
 	 * partially in any regular NID ranges from any other nodemap.
 	 */
 	down_write(&active_config->nmc_range_tree_lock);
 	range = range_find(config, &nid[0], &nid[1], netmask, false);
-	if (is_default_nodemap(nodemap)) {
+	if (is_default_nodemap(nodemap) || nodemap->nmf_gss_identify) {
 		if (range)
 			rc = -EINVAL;
 		if (range_search(config, (struct lnet_nid *)&nid[0]) ||
@@ -1641,7 +1804,7 @@ int nodemap_add_banlist(const char *name, const struct lnet_nid nid[2],
 		nodemap_getref(nodemap);
 		up_read(&active_config->nmc_range_tree_lock);
 	} else {
-		nodemap = nodemap_lookup(name);
+		nodemap = nodemap_lookup_locked(name);
 		if (IS_ERR(nodemap)) {
 			mutex_unlock(&active_config_lock);
 			GOTO(out, rc = PTR_ERR(nodemap));
@@ -1697,7 +1860,7 @@ int nodemap_del_banlist(const char *name, const struct lnet_nid nid[2],
 		nodemap_getref(nodemap);
 		up_read(&active_config->nmc_range_tree_lock);
 	} else {
-		nodemap = nodemap_lookup(name);
+		nodemap = nodemap_lookup_locked(name);
 		if (IS_ERR(nodemap)) {
 			mutex_unlock(&active_config_lock);
 			GOTO(out, rc = PTR_ERR(nodemap));
@@ -2859,7 +3022,7 @@ int nodemap_set_fileset_prim_lproc(const char *nodemap_name,
 		RETURN(-ENAMETOOLONG);
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
+	nodemap = nodemap_lookup_locked(nodemap_name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		RETURN(PTR_ERR(nodemap));
@@ -3131,7 +3294,7 @@ int nodemap_set_sepol(const char *name, const char *sepol, bool checkperm)
 		GOTO(out, rc);
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
+	nodemap = nodemap_lookup_locked(name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = PTR_ERR(nodemap));
@@ -3174,6 +3337,32 @@ const char *nodemap_get_sepol(const struct lu_nodemap *nodemap)
 		return (char *)nodemap->nm_sepol;
 }
 EXPORT_SYMBOL(nodemap_get_sepol);
+
+static int nodemap_sha256(struct lu_nodemap *nodemap)
+{
+	struct crypto_shash *tfm;
+	int rc;
+
+	tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(tfm))
+		GOTO(out_sha, rc = PTR_ERR(tfm));
+
+	{
+		SHASH_DESC_ON_STACK(desc, tfm);
+		desc->tfm = tfm;
+		rc = crypto_shash_digest(desc, nodemap->nm_name,
+					 strlen(nodemap->nm_name),
+					 nodemap->nm_sha);
+		shash_desc_zero(desc);
+	}
+
+	crypto_free_shash(tfm);
+out_sha:
+	if (rc)
+		memset(nodemap->nm_sha, 0, sizeof(nodemap->nm_sha));
+
+	return rc;
+}
 
 /**
  * nodemap_set_capabilities() - Define user capabilities on nodemap
@@ -3219,7 +3408,7 @@ int nodemap_set_capabilities(const char *name, char *buffer)
 		GOTO(out, rc = -EINVAL);
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
+	nodemap = nodemap_lookup_locked(name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = PTR_ERR(nodemap));
@@ -3332,7 +3521,7 @@ struct lu_nodemap *nodemap_create(const char *name,
 		/* the call to nodemap_create for a dynamic nodemap comes from
 		 * nodemap_add, which holds the active_config_lock
 		 */
-		parent_nodemap = nodemap_lookup(pname);
+		parent_nodemap = nodemap_lookup_locked(pname);
 		if (IS_ERR(parent_nodemap))
 			GOTO(out, rc = PTR_ERR(parent_nodemap));
 	} else {
@@ -3398,6 +3587,23 @@ struct lu_nodemap *nodemap_create(const char *name,
 	mutex_init(&nodemap->nm_member_list_lock);
 	init_rwsem(&nodemap->nm_idmap_lock);
 
+	/* compute sha256 of nodemap name and put it in nm_sha */
+	rc = nodemap_sha256(nodemap);
+	if (rc) {
+		CDEBUG_LIMIT(D_INFO,
+			     "%s: failed to generate sha256 for nodemap name: rc=%d\n",
+			     nodemap->nm_name, rc);
+		if (nodemap->nmf_gss_identify)
+			GOTO(out_list_hash, rc = -ENOENT);
+	} else {
+		rc = rhashtable_insert_fast(&config->nmc_nodemap_sha_hash,
+					    &nodemap->nm_sha_hash,
+					    nodemap_sha_hash_params);
+		if (rc)
+			GOTO(out_list_hash, rc = -EEXIST);
+		nodemap_getref(nodemap);
+	}
+
 	if (is_default) {
 		nodemap->nm_id = LUSTRE_NODEMAP_DEFAULT_ID;
 		config->nmc_default_nodemap = nodemap;
@@ -3412,6 +3618,10 @@ struct lu_nodemap *nodemap_create(const char *name,
 
 	RETURN(nodemap);
 
+out_list_hash:
+	if (!list_empty(&nodemap->nm_parent_entry))
+		list_del(&nodemap->nm_parent_entry);
+	(void *)cfs_hash_del_key(hash, newname);
 out:
 	OBD_FREE_PTR(nodemap);
 	if (!IS_ERR_OR_NULL(parent_nodemap))
@@ -3433,9 +3643,7 @@ int nodemap_set_deny_unknown(const char *name, bool deny_unknown)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3468,9 +3676,7 @@ int nodemap_set_allow_root(const char *name, bool allow_root)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3503,9 +3709,7 @@ int nodemap_set_trust_client_ids(const char *name, bool trust_client_ids)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3531,9 +3735,7 @@ int nodemap_set_mapping_mode(const char *name,
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3585,9 +3787,7 @@ int nodemap_set_rbac(const char *name, enum nodemap_rbac_roles rbac)
 	enum nodemap_rbac_roles old_rbac;
 	int rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3634,9 +3834,7 @@ int nodemap_set_squash_uid(const char *name, uid_t uid)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3671,9 +3869,7 @@ int nodemap_set_squash_gid(const char *name, gid_t gid)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3709,9 +3905,7 @@ int nodemap_set_squash_projid(const char *name, projid_t projid)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3820,9 +4014,7 @@ int nodemap_set_audit_mode(const char *name, bool enable_audit)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3853,9 +4045,7 @@ int nodemap_set_forbid_encryption(const char *name, bool forbid_encryption)
 	struct lu_nodemap *nodemap = NULL;
 	int rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3895,9 +4085,7 @@ int nodemap_set_raise_privs(const char *name, enum nodemap_raise_privs privs,
 	enum nodemap_rbac_roles old_rbac_raise;
 	int rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3938,9 +4126,7 @@ int nodemap_set_readonly_mount(const char *name, bool readonly_mount)
 	struct lu_nodemap	*nodemap = NULL;
 	int			rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3973,9 +4159,7 @@ int nodemap_set_deny_mount(const char *name, bool deny_mount)
 	struct lu_nodemap *nodemap = NULL;
 	int rc = 0;
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(name);
 	if (IS_ERR(nodemap))
 		RETURN(PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap))
@@ -3993,6 +4177,54 @@ out_putref:
 	return rc;
 }
 EXPORT_SYMBOL(nodemap_set_deny_mount);
+
+/**
+ * nodemap_set_gss_identify() - Set the nmf_gss_identify flag to true or false.
+ * @name: nodemap name
+ * @gss_identify: if true, identify clients based on the GSS token
+ *
+ * Return:
+ * * %0 on success
+ */
+int nodemap_set_gss_identify(const char *name, bool gss_identify)
+{
+	struct lu_nodemap *nodemap = NULL;
+	int rc = 0;
+
+	nodemap = nodemap_lookup_unlocked(name);
+	if (IS_ERR(nodemap))
+		RETURN(PTR_ERR(nodemap));
+
+	if (is_default_nodemap(nodemap))
+		GOTO(out_putref, rc = -EINVAL);
+	if (!allow_op_on_nm(nodemap))
+		GOTO(out_putref, rc = -EPERM);
+
+	if (!list_empty(&nodemap->nm_ranges)) {
+		CDEBUG(D_INFO,
+		       "nodemap %s must have empty NID range to set 'gssonly_identification' property\n",
+		       nodemap->nm_name);
+		GOTO(out_putref, rc = -EPERM);
+	}
+
+	if (memcmp(nodemap->nm_sha, (const char[SHA256_DIGEST_SIZE]){0},
+		   SHA256_DIGEST_SIZE) == 0) {
+		CDEBUG(D_INFO,
+		       "nodemap %s must have valid sha256 to set 'gssonly_identification' property\n",
+		       nodemap->nm_name);
+		GOTO(out_putref, rc = -EPERM);
+	}
+
+	nodemap->nmf_gss_identify = gss_identify;
+	rc = nodemap_idx_nodemap_update(nodemap);
+
+	nm_member_revoke_locks(nodemap);
+
+out_putref:
+	nodemap_putref(nodemap);
+	return rc;
+}
+EXPORT_SYMBOL(nodemap_set_gss_identify);
 
 /**
  * nodemap_add() - Add a nodemap
@@ -4056,9 +4288,7 @@ int nodemap_del(const char *nodemap_name, bool *out_clean_llog_fileset)
 	if (strcmp(nodemap_name, DEFAULT_NODEMAP) == 0)
 		RETURN(-EINVAL);
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
-	mutex_unlock(&active_config_lock);
+	nodemap = nodemap_lookup_unlocked(nodemap_name);
 	if (IS_ERR(nodemap))
 		GOTO(out, rc = PTR_ERR(nodemap));
 	if (!allow_op_on_nm(nodemap)) {
@@ -4091,6 +4321,11 @@ int nodemap_del(const char *nodemap_name, bool *out_clean_llog_fileset)
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = -ENOENT);
 	}
+
+	(void)rhashtable_remove_fast(&active_config->nmc_nodemap_sha_hash,
+				     &nodemap->nm_sha_hash,
+				     nodemap_sha_hash_params);
+	nodemap_putref(nodemap);
 
 	/* erase nodemap from active ranges to prevent client assignment */
 	down_write(&active_config->nmc_range_tree_lock);
@@ -4156,6 +4391,45 @@ out:
 	return rc;
 }
 EXPORT_SYMBOL(nodemap_del);
+
+/**
+ * nodemap_clear_dynamic_nodemaps() - Remove all dynamic nodemaps
+ *
+ * This function iterates over all persistent nodemaps and deletes their
+ * sub-nodemaps.
+ */
+void nodemap_clear_dynamic_nodemaps(void)
+{
+	struct lu_nodemap *nodemap, *tmp;
+	struct lu_nodemap *dyn_nm, *dyn_nm_tmp;
+	LIST_HEAD(nodemap_list);
+
+	mutex_lock(&active_config_lock);
+	cfs_hash_for_each_safe(active_config->nmc_nodemap_hash, nm_hash_list_cb,
+			       &nodemap_list);
+
+	/* take refs on persistent nodemaps, remove dynamic ones from list */
+	list_for_each_entry_safe(nodemap, tmp, &nodemap_list, nm_list) {
+		if (nodemap->nm_dyn)
+			list_del(&nodemap->nm_list);
+		else
+			nodemap_getref(nodemap);
+	}
+	mutex_unlock(&active_config_lock);
+
+	/* for each persistent nodemap, delete its sub-nodemaps */
+	list_for_each_entry_safe(nodemap, tmp, &nodemap_list, nm_list) {
+		list_for_each_entry_safe(dyn_nm, dyn_nm_tmp,
+					 &nodemap->nm_subnodemaps,
+					 nm_parent_entry) {
+			/* nodemap_del() recursively deletes sub-dyn-nodemaps */
+			nodemap_del(dyn_nm->nm_name, NULL);
+		}
+
+		nodemap_putref(nodemap);
+	}
+}
+EXPORT_SYMBOL(nodemap_clear_dynamic_nodemaps);
 
 /* Do not call this method directly unless the ranges and nodemap have been
  * previously verified.
@@ -4245,7 +4519,7 @@ int nodemap_add_offset(const char *nodemap_name, char *offset)
 	}
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
+	nodemap = nodemap_lookup_locked(nodemap_name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = -ENOENT);
@@ -4336,7 +4610,7 @@ int nodemap_del_offset(const char *nodemap_name)
 	int rc = 0;
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
+	nodemap = nodemap_lookup_locked(nodemap_name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		GOTO(out, rc = -ENOENT);
@@ -4428,6 +4702,13 @@ struct nodemap_config *nodemap_config_alloc(void)
 		return ERR_PTR(rc);
 	}
 
+	rc = nodemap_init_sha_hash(config);
+	if (rc != 0) {
+		cfs_hash_putref(config->nmc_nodemap_hash);
+		OBD_FREE_PTR(config);
+		return ERR_PTR(rc);
+	}
+
 	init_rwsem(&config->nmc_range_tree_lock);
 	init_rwsem(&config->nmc_ban_range_tree_lock);
 
@@ -4441,6 +4722,13 @@ struct nodemap_config *nodemap_config_alloc(void)
 }
 EXPORT_SYMBOL(nodemap_config_alloc);
 
+static void lu_nodemap_exit(void *vnodemap, void *data)
+{
+	struct lu_nodemap *nm = vnodemap;
+
+	nodemap_putref(nm);
+}
+
 /**
  * nodemap_config_dealloc() - Walk the nodemap_hash and remove all nodemaps.
  * @config: pointer to struct nodemap_config which will get dealloc
@@ -4453,6 +4741,8 @@ void nodemap_config_dealloc(struct nodemap_config *config)
 	struct lu_nid_range	*range_temp;
 	LIST_HEAD(nodemap_list_head);
 
+	rhashtable_free_and_destroy(&config->nmc_nodemap_sha_hash,
+				    lu_nodemap_exit, NULL);
 	cfs_hash_for_each_safe(config->nmc_nodemap_hash,
 			       nodemap_cleanup_iter_cb, &nodemap_list_head);
 	cfs_hash_putref(config->nmc_nodemap_hash);
@@ -4720,10 +5010,7 @@ static bool nodemap_is_dynamic(const char *nodemap_name)
 	if (!nodemap_name || strcmp(nodemap_name, DEFAULT_NODEMAP) == 0)
 		RETURN(false);
 
-	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
-	mutex_unlock(&active_config_lock);
-
+	nodemap = nodemap_lookup_unlocked(nodemap_name);
 	if (IS_ERR(nodemap))
 		RETURN(false);
 
@@ -4779,7 +5066,7 @@ static int cfg_nodemap_fileset_cmd(struct lustre_cfg *lcfg,
 	}
 
 	mutex_lock(&active_config_lock);
-	nodemap = nodemap_lookup(nodemap_name);
+	nodemap = nodemap_lookup_locked(nodemap_name);
 	if (IS_ERR(nodemap)) {
 		mutex_unlock(&active_config_lock);
 		RETURN(PTR_ERR(nodemap));
@@ -4959,6 +5246,12 @@ static int cfg_nodemap_cmd(enum lcfg_command_type cmd, const char *nodemap_name,
 		rc = kstrtobool(param, &bool_switch);
 		if (rc == 0)
 			rc = nodemap_set_deny_mount(nodemap_name, bool_switch);
+		break;
+	case LCFG_NODEMAP_GSS_IDENTIFY:
+		rc = kstrtobool(param, &bool_switch);
+		if (rc == 0)
+			rc = nodemap_set_gss_identify(nodemap_name,
+						      bool_switch);
 		break;
 	case LCFG_NODEMAP_MAP_MODE:
 	{
@@ -5276,6 +5569,22 @@ int server_iocontrol_nodemap(struct obd_device *obd,
 		if (out_ro_cmd)
 			*out_ro_cmd = true;
 		break;
+	case LCFG_NODEMAP_LOOKUP_SHA:
+		if (lcfg->lcfg_bufcount != 2)
+			GOTO(out_lcfg, rc = -EINVAL);
+		if (LUSTRE_CFG_BUFLEN(lcfg, 1) != SHA256_DIGEST_SIZE)
+			GOTO(out_lcfg, rc = -EINVAL);
+
+		param = lustre_cfg_buf(lcfg, 1);
+		rc = nodemap_lookup_sha(param, name_buf, sizeof(name_buf));
+		if (rc)
+			GOTO(out_lcfg, rc);
+		rc = copy_to_user(data->ioc_pbuf1, name_buf,
+				  min_t(size_t, data->ioc_plen1,
+					sizeof(name_buf)));
+		if (rc)
+			GOTO(out_lcfg, rc = -EFAULT);
+		break;
 	case LCFG_NODEMAP_TEST_ID:
 		if (lcfg->lcfg_bufcount != 4)
 			GOTO(out_lcfg, rc = -EINVAL);
@@ -5346,6 +5655,7 @@ int server_iocontrol_nodemap(struct obd_device *obd,
 	case LCFG_NODEMAP_RAISE_PRIVS:
 	case LCFG_NODEMAP_READONLY_MOUNT:
 	case LCFG_NODEMAP_DENY_MOUNT:
+	case LCFG_NODEMAP_GSS_IDENTIFY:
 	case LCFG_NODEMAP_RBAC:
 		if (lcfg->lcfg_bufcount != 4)
 			GOTO(out_lcfg, rc = -EINVAL);

@@ -124,7 +124,7 @@ struct mgs_export_data {
  */
 struct nid_stat {
 	struct lnet_nid		 nid;
-	struct hlist_node	 nid_hash;
+	struct rhlist_head	 nid_hash;
 	struct list_head	 nid_list;
 	struct obd_device       *nid_obd;
 	struct dentry		*nid_debugfs;
@@ -314,7 +314,7 @@ static inline int lprocfs_nid_ldlm_stats_init(struct nid_stat *tmp)
 	lprocfs_init_ldlm_stats(tmp->nid_ldlm_stats);
 
 	debugfs_create_file("ldlm_stats", 0644, tmp->nid_debugfs,
-			    tmp->nid_stats, &ldebugfs_stats_seq_fops);
+			    tmp->nid_ldlm_stats, &ldebugfs_stats_seq_fops);
 
 	return 0;
 }

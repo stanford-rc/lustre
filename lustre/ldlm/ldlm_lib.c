@@ -493,11 +493,11 @@ int client_obd_setup(struct obd_device *obd, struct lustre_cfg *lcfg)
 
 	if (!strcmp(name, LUSTRE_MDC_NAME)) {
 		cli->cl_max_rpcs_in_flight = OBD_MAX_RIF_DEFAULT;
-	} else if (cfs_totalram_pages() >> (20 - PAGE_SHIFT) <= 128 /* MB */) {
+	} else if (compat_totalram_pages() >> (20 - PAGE_SHIFT) <= 128 /* MB */) {
 		cli->cl_max_rpcs_in_flight = 2;
-	} else if (cfs_totalram_pages() >> (20 - PAGE_SHIFT) <= 256 /* MB */) {
+	} else if (compat_totalram_pages() >> (20 - PAGE_SHIFT) <= 256 /* MB */) {
 		cli->cl_max_rpcs_in_flight = 3;
-	} else if (cfs_totalram_pages() >> (20 - PAGE_SHIFT) <= 512 /* MB */) {
+	} else if (compat_totalram_pages() >> (20 - PAGE_SHIFT) <= 512 /* MB */) {
 		cli->cl_max_rpcs_in_flight = 4;
 	} else {
 		if (osc_on_mdt(obd->obd_name))
@@ -1191,8 +1191,9 @@ int target_handle_connect(struct ptlrpc_request *req)
 			       "stopping" : "not set up"));
 		GOTO(out, rc = -ENODEV);
 	}
-
-	if (target->obd_no_conn) {
+	/* allow only local connection for MGS */
+	if (target->obd_no_conn && !(nid_is_lo0(&req->rq_peer.nid) &&
+			!strcmp(target->obd_name, LUSTRE_MGS_OBDNAME))) {
 		CDEBUG(D_INFO,
 		       "%s: Temporarily refusing client connection from %s\n",
 		       target->obd_name, libcfs_nidstr(&req->rq_peer.nid));
@@ -1493,8 +1494,7 @@ no_export:
 		} else {
 dont_check_exports:
 			rc = obd_connect(req->rq_svc_thread->t_env,
-					 &export, target, &cluuid, data,
-					 &req->rq_peer.nid);
+					 &export, target, &cluuid, data, req);
 			if (mds_conn && CFS_FAIL_CHECK(OBD_FAIL_TGT_RCVG_FLAG))
 				lustre_msg_add_op_flags(req->rq_repmsg,
 							MSG_CONNECT_RECOVERING);
@@ -1513,8 +1513,7 @@ dont_check_exports:
 			class_export_put(export);
 		}
 		rc = obd_reconnect(req->rq_svc_thread->t_env,
-				   export, target, &cluuid, data,
-				   &req->rq_peer.nid);
+				   export, target, &cluuid, data, req);
 		if (rc == 0) {
 			reconnected = true;
 			/*
@@ -1851,7 +1850,8 @@ static void target_finish_recovery(struct lu_target *lut)
 			      atomic_read(&obd->obd_connected_clients),
 			      obd->obd_stale_clients,
 			      obd->obd_stale_clients == 1 ? "was" : "were");
-		if (obd->obd_stale_clients && do_dump_on_eviction(obd))
+		if (obd->obd_stale_clients &&
+		    do_dump_on_eviction(obd, DUMP_RECOVERY_STALE))
 			libcfs_debug_dumplog();
 	}
 

@@ -107,11 +107,17 @@ case $with_o2ib in
 			# and we could clean all that complexity
 			# but I don't know how far we should be retro-compatible.
 
-			if test -n "$O2IBDIR_PATH"; then
+			# The steps above cannot retrieve the path in some cases
+			# (e.g mlnx-ofa_kernel-source and mlnx-ofa_kernel-dksm),
+			# so set it to a default value if it is NULL.
+			if test -z "$O2IBDIR_PATH"; then
+				O2IBDIR_PATH="/usr/src/ofa_kernel"
+			fi
+			if test -d $O2IBDIR_PATH; then
 				if test -d $O2IBDIR_PATH/${target_cpu}/${LINUXRELEASE}; then
 					O2IBDIR_PATH=$O2IBDIR_PATH/${target_cpu}/${LINUXRELEASE}
 				fi
-				EXT_O2IBPATHS=$(find $O2IBDIR_PATH -name rdma_cm.h |
+				EXT_O2IBPATHS=$(find -H $O2IBDIR_PATH -name rdma_cm.h |
 					sed -e 's/\/include\/rdma\/rdma_cm.h//')
 			fi
 
@@ -197,7 +203,7 @@ AS_IF([test $ENABLEO2IB = "no"], [
 		])
 	done
 	if ! $ext_o2ib_found; then
-		case $EXT_ENABLEO2IB in
+		case $ENABLEO2IB in
 			"withpath") AC_MSG_ERROR([bad --with-o2ib path]) ;;
 			*) 	AC_MSG_WARN([
 Auto detection of external O2IB failed. Build of external o2ib disabled.])
@@ -1165,27 +1171,6 @@ AC_DEFUN([LN_CONFIG_SOCK_NOT_OWNED_BY_ME], [
 ]) # LN_CONFIG_SOCK_NOT_OWNED_BY_ME
 
 #
-# LN_CONFIG_SK_DATA_READY
-#
-# 3.15 for struct sock the *sk_data_ready() field only takes one argument now
-#
-AC_DEFUN([LN_SRC_CONFIG_SK_DATA_READY], [
-	LB2_LINUX_TEST_SRC([sk_data_ready], [
-		#include <linux/net.h>
-		#include <net/sock.h>
-	],[
-		((struct sock *)0)->sk_data_ready(NULL);
-	],[-Werror])
-])
-AC_DEFUN([LN_CONFIG_SK_DATA_READY], [
-	LB2_MSG_LINUX_TEST_RESULT([if 'sk_data_ready' takes only one argument],
-	[sk_data_ready], [
-	AC_DEFINE(HAVE_SK_DATA_READY_ONE_ARG, 1,
-		[sk_data_ready uses only one argument])
-	])
-]) # LN_CONFIG_SK_DATA_READY
-
-#
 # LN_ETHTOOL_LINK_SETTINGS
 #
 # ethtool_link_settings was added in Linux 4.6
@@ -1204,27 +1189,6 @@ AC_DEFUN([LN_ETHTOOL_LINK_SETTINGS], [
 			[ethtool_link_settings is defined])
 	])
 ]) # LN_ETHTOOL_LINK_SETTINGS
-
-#
-# LN_HAVE_HYPERVISOR_IS_TYPE
-#
-# 4.14 commit 79cc74155218316b9a5d28577c7077b2adba8e58
-# x86/paravirt: Provide a way to check for hypervisors
-#
-AC_DEFUN([LN_SRC_HAVE_HYPERVISOR_IS_TYPE], [
-	LB2_LINUX_TEST_SRC([hypervisor_is_type_exists], [
-		#include <asm/hypervisor.h>
-	],[
-		(void)hypervisor_is_type(X86_HYPER_NATIVE);
-	],[-Werror])
-])
-AC_DEFUN([LN_HAVE_HYPERVISOR_IS_TYPE], [
-	LB2_MSG_LINUX_TEST_RESULT([if hypervisor_is_type function is available],
-	[hypervisor_is_type_exists], [
-		AC_DEFINE(HAVE_HYPERVISOR_IS_TYPE, 1,
-			[hypervisor_is_type function exists])
-	])
-]) # LN_HAVE_HYPERVISOR_IS_TYPE
 
 #
 # LN_HAVE_ORACLE_OFED_EXTENSIONS
@@ -1319,6 +1283,26 @@ AC_DEFUN([LN_HAVE_IN_DEV_FOR_EACH_IFA_RTNL], [
 ]) # LN_HAVE_IN_DEV_FOR_EACH_IFA_RTNL
 
 #
+# LN_SRC_HAVE_NETDEV_LOCK_OPS
+#
+# netdev_lock_ops() added in v6.14-rc4-1113-gd4c22ec680 to lock ethtool changes
+#
+AC_DEFUN([LN_SRC_HAVE_NETDEV_LOCK_OPS], [
+	LB2_LINUX_TEST_SRC([netdev_lock_ops], [
+		#include <net/netdev_lock.h>
+	],[
+		netdev_lock_ops(NULL);
+	],[-Werror])
+])
+AC_DEFUN([LN_HAVE_NETDEV_LOCK_OPS], [
+	LB2_MSG_LINUX_TEST_RESULT([if 'netdev_lock_ops' exist],
+	[netdev_lock_ops], [
+		AC_DEFINE(HAVE_NETDEV_LOCK_OPS, 1,
+			['netdev_lock_ops' is present])
+	])
+]) # LN_SRC_HAVE_NETDEV_LOCK_OPS
+
+#
 # LN_USR_RDMA
 #
 #
@@ -1337,10 +1321,30 @@ AC_COMPILE_IFELSE([AC_LANG_SOURCE([
 ])
 ]) # LN_USR_RDMA
 
+#
+# LN_CONFIG_SENDPAGE_OK
+#
+# kernel commit v5.9-rc6-325-gc381b07941 added sendpage_ok() helper
+# check if sendpage_ok() is available
+#
+AC_DEFUN([LN_SRC_CONFIG_SENDPAGE_OK], [
+	LB2_LINUX_TEST_SRC([sendpage_ok], [
+		#include <linux/net.h>
+	],[
+		struct page *page = NULL;
+		(void)sendpage_ok(page);
+	],[-Werror])
+])
+AC_DEFUN([LN_CONFIG_SENDPAGE_OK], [
+	LB2_MSG_LINUX_TEST_RESULT([if sendpage_ok() is available],
+	[sendpage_ok], [
+		AC_DEFINE(HAVE_SENDPAGE_OK, 1,
+			[sendpage_ok() is available])
+	])
+]) # LN_CONFIG_SENDPAGE_OK
+
 AC_DEFUN([LN_PROG_LINUX_SRC], [
 	LN_CONFIG_O2IB_SRC
-	# 3.15
-	LN_SRC_CONFIG_SK_DATA_READY
 	# 4.x
 	LN_SRC_CONFIG_SOCK_CREATE_KERN
 	LN_SRC_CONFIG_SOCK_INUSE_ADD
@@ -1348,7 +1352,6 @@ AC_DEFUN([LN_PROG_LINUX_SRC], [
 	# 4.6
 	LN_SRC_ETHTOOL_LINK_SETTINGS
 	# 4.14
-	LN_SRC_HAVE_HYPERVISOR_IS_TYPE
 	LN_SRC_HAVE_ORACLE_OFED_EXTENSIONS
 	# 4.16
 	LN_SRC_HAVE_NETDEV_CMD_TO_NAME
@@ -1356,12 +1359,14 @@ AC_DEFUN([LN_PROG_LINUX_SRC], [
 	LN_SRC_CONFIG_SOCK_GETNAME
 	# 5.3 and 4.18.0-193.el8
 	LN_SRC_HAVE_IN_DEV_FOR_EACH_IFA_RTNL
+	# 5.9
+	LN_SRC_CONFIG_SENDPAGE_OK
+	# 6.15
+	LN_SRC_HAVE_NETDEV_LOCK_OPS
 ])
 
 AC_DEFUN([LN_PROG_LINUX_RESULTS], [
 	LN_CONFIG_O2IB_RESULTS
-	# 3.15
-	LN_CONFIG_SK_DATA_READY
 	# 4.x
 	LN_CONFIG_SOCK_CREATE_KERN
 	LN_CONFIG_SOCK_INUSE_ADD
@@ -1369,7 +1374,6 @@ AC_DEFUN([LN_PROG_LINUX_RESULTS], [
 	# 4.6
 	LN_ETHTOOL_LINK_SETTINGS
 	# 4.14
-	LN_HAVE_HYPERVISOR_IS_TYPE
 	LN_HAVE_ORACLE_OFED_EXTENSIONS
 	# 4.16
 	LN_HAVE_NETDEV_CMD_TO_NAME
@@ -1377,6 +1381,10 @@ AC_DEFUN([LN_PROG_LINUX_RESULTS], [
 	LN_CONFIG_SOCK_GETNAME
 	# 5.3 and 4.18.0-193.el8
 	LN_HAVE_IN_DEV_FOR_EACH_IFA_RTNL
+	# 5.9
+	LN_CONFIG_SENDPAGE_OK
+	# 6.15
+	LN_HAVE_NETDEV_LOCK_OPS
 ])
 
 #

@@ -933,6 +933,37 @@ out:
 	return rc;
 }
 
+/**
+ * mgs_has_local_targets() - check if MGS is co-located with an MDT or OST
+ *
+ * Check if there are any MDT or OST targets on the MGS node. This is done by
+ * checking whether the device types are registered.
+ *
+ * Return: true if MDT or OST type exists, false otherwise
+ */
+static bool mgs_has_local_targets(void)
+{
+	struct obd_type *mdt_type;
+	struct obd_type *ost_type;
+	bool has_targets = false;
+
+	mdt_type = class_search_type(LUSTRE_MDT_NAME);
+	if (mdt_type) {
+		kobject_put(&mdt_type->typ_kobj);
+		has_targets = true;
+	}
+
+	if (!has_targets) {
+		ost_type = class_search_type(LUSTRE_OST_NAME);
+		if (ost_type) {
+			kobject_put(&ost_type->typ_kobj);
+			has_targets = true;
+		}
+	}
+
+	return has_targets;
+}
+
 static int mgs_iocontrol_nodemap(const struct lu_env *env,
 				 struct mgs_device *mgs,
 				 struct obd_ioctl_data *data)
@@ -973,6 +1004,10 @@ static int mgs_iocontrol_nodemap(const struct lu_env *env,
 			CWARN("%s: failed to cleanup llog fileset: %d\n",
 			      mgs->mgs_obd->obd_name, rc2);
 	}
+
+	/* if MGS is co-located with an MDT or OST, clear dynamic nodemaps */
+	if (mgs_has_local_targets())
+		nodemap_clear_dynamic_nodemaps();
 
 	/* revoke nodemap lock */
 	rc = mgs_find_or_make_fsdb(env, mgs, LUSTRE_NODEMAP_NAME, &fsdb);
@@ -1361,6 +1396,7 @@ static int mgs_init0(const struct lu_env *env, struct mgs_device *mgs,
 	struct obd_device		*obd;
 	struct lustre_mount_info	*lmi;
 	struct llog_ctxt		*ctxt;
+	struct lustre_sb_info *lsi;
 	int				 rc;
 
 	ENTRY;
@@ -1397,6 +1433,9 @@ static int mgs_init0(const struct lu_env *env, struct mgs_device *mgs,
 
 	/* No recovery for MGCs */
 	obd->obd_replayable = 0;
+	lsi = s2lsi(lmi->lmi_sb);
+	if (test_bit(LMD_FLG_NO_RCLNT, lsi->lsi_lmd->lmd_flags))
+		obd->obd_no_conn = 1;
 
 	rc = tgt_init(env, &mgs->mgs_lut, obd, mgs->mgs_bottom,
 		      mgs_common_slice, OBD_FAIL_MGS_ALL_REQUEST_NET,
@@ -1733,6 +1772,9 @@ static int mgs_obd_reconnect(const struct lu_env *env, struct obd_export *exp,
 			     struct obd_device *obd, struct obd_uuid *cluuid,
 			     struct obd_connect_data *data, void *localdata)
 {
+	struct ptlrpc_request *req = localdata;
+	struct lnet_nid *client_nid = NULL;
+
 	ENTRY;
 
 	if (exp == NULL || obd == NULL || cluuid == NULL)
@@ -1750,7 +1792,10 @@ static int mgs_obd_reconnect(const struct lu_env *env, struct obd_export *exp,
 		data->ocd_version = LUSTRE_VERSION_CODE;
 	}
 
-	RETURN(mgs_export_stats_init(obd, exp, localdata));
+	if (req)
+		client_nid = &req->rq_peer.nid;
+
+	RETURN(mgs_export_stats_init(obd, exp, client_nid));
 }
 
 static int mgs_obd_connect(const struct lu_env *env, struct obd_export **exp,
@@ -1840,7 +1885,7 @@ static int __init mgs_init(void)
 	if (rc)
 		return rc;
 
-	return class_register_type(&mgs_obd_device_ops, NULL, true,
+	return class_register_type(&mgs_obd_device_ops, NULL, false,
 				   LUSTRE_MGS_NAME, &mgs_device_type);
 }
 

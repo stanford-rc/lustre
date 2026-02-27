@@ -140,8 +140,7 @@ module_param(wrq_sge, uint, 0444);
 MODULE_PARM_DESC(wrq_sge, "# scatter/gather element per work request");
 
 static int tos = -1;
-static int param_set_tos(const char *val, cfs_kernel_param_arg_t *kp);
-#ifdef HAVE_KERNEL_PARAM_OPS
+static int param_set_tos(const char *val, const struct kernel_param *kp);
 static const struct kernel_param_ops param_ops_tos = {
 	.set = param_set_tos,
 	.get = param_get_int,
@@ -150,31 +149,28 @@ static const struct kernel_param_ops param_ops_tos = {
 #define param_check_tos(name, p) \
 	__param_check(name, p, int)
 module_param(tos, tos, 0444);
-#else
-module_param_call(tos, param_set_tos, param_get_int, &tos, 0444);
-#endif
 MODULE_PARM_DESC(tos, "Set the type of service (=-1 to disable)");
 
 struct kib_tunables kiblnd_tunables = {
-        .kib_dev_failover           = &dev_failover,
-        .kib_service                = &service,
-        .kib_cksum                  = &cksum,
-        .kib_timeout                = &timeout,
-        .kib_keepalive              = &keepalive,
-        .kib_default_ipif           = &ipif_name,
-        .kib_retry_count            = &retry_count,
-        .kib_rnr_retry_count        = &rnr_retry_count,
-        .kib_ib_mtu                 = &ib_mtu,
-        .kib_require_priv_port      = &require_privileged_port,
-	.kib_use_priv_port	    = &use_privileged_port,
-	.kib_nscheds		    = &nscheds,
-	.kib_wrq_sge		    = &wrq_sge,
-	.kib_use_fastreg_gaps       = &use_fastreg_gaps,
+	.kib_dev_failover	= &dev_failover,
+	.kib_service		= &service,
+	.kib_cksum		= &cksum,
+	.kib_timeout		= &timeout,
+	.kib_keepalive		= &keepalive,
+	.kib_default_ipif	= &ipif_name,
+	.kib_retry_count	= &retry_count,
+	.kib_rnr_retry_count	= &rnr_retry_count,
+	.kib_ib_mtu		= &ib_mtu,
+	.kib_require_priv_port	= &require_privileged_port,
+	.kib_use_priv_port	= &use_privileged_port,
+	.kib_nscheds		= &nscheds,
+	.kib_wrq_sge		= &wrq_sge,
+	.kib_use_fastreg_gaps	= &use_fastreg_gaps,
 };
 
 struct lnet_ioctl_config_o2iblnd_tunables kib_default_tunables;
 
-static int param_set_tos(const char *val, cfs_kernel_param_arg_t *kp)
+static int param_set_tos(const char *val, const struct kernel_param *kp)
 {
 	int rc, t;
 

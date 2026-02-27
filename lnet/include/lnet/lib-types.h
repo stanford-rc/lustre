@@ -20,13 +20,13 @@
 #endif
 
 #include <linux/bvec.h>
+#include <linux/generic-radix-tree.h>
 #include <linux/kthread.h>
 #include <linux/uio.h>
 #include <linux/semaphore.h>
 #include <linux/types.h>
 #include <linux/kref.h>
 #include <net/genetlink.h>
-#include <lustre_compat/linux/generic-radix-tree.h>
 
 #include <uapi/linux/lnet/lnet-nl.h>
 #include <uapi/linux/lnet/lnet-dlc.h>
@@ -242,7 +242,7 @@ struct lnet_libmd {
 
 static inline bool lnet_md_is_gpu(struct lnet_libmd *md)
 {
-    return (md != NULL) && !!(md->md_flags & LNET_MD_FLAG_GPU);
+	return (md != NULL) && !!(md->md_flags & LNET_MD_FLAG_GPU);
 }
 
 struct lnet_test_peer {
@@ -1981,6 +1981,12 @@ struct lnet {
 	struct list_head		ln_nets;
 	/* Sequence number used to round robin sends across all nets */
 	__u32				ln_net_seq;
+	/*
+	 * Count of NIs/nets with restricted CPT configurations.
+	 * When 0, lnet_nid2cpt() can use fast hash-only path even
+	 * when ni==NULL, since all networks use all CPTs.
+	 */
+	atomic_t			ln_cpt_restricted_count;
 	/* the loopback NI */
 	struct lnet_ni			*ln_loni;
 	/* network zombie list */
@@ -2144,32 +2150,5 @@ static const struct nla_policy scalar_attr_policy[LN_SCALAR_MAX + 1] = {
 int lnet_genl_send_scalar_list(struct sk_buff *msg, u32 portid, u32 seq,
 			       const struct genl_family *family, int flags,
 			       u8 cmd, const struct ln_key_list *data[]);
-
-/* Special workaround for pre-4.19 kernels to send error messages
- * from dumpit routines. Newer kernels will send message with
- * NL_SET_ERR_MSG information by default if NETLINK_EXT_ACK is set.
- */
-static inline int lnet_nl_send_error(struct sk_buff *msg, int portid, int seq,
-				     int error)
-{
-#ifndef HAVE_NL_DUMP_WITH_EXT_ACK
-	struct nlmsghdr *nlh;
-
-	if (!error)
-		return 0;
-
-	nlh = nlmsg_put(msg, portid, seq, NLMSG_ERROR, sizeof(error), 0);
-	if (!nlh)
-		return -ENOMEM;
-#ifdef HAVE_NL_PARSE_WITH_EXT_ACK
-	netlink_ack(msg, nlh, error, NULL);
-#else
-	netlink_ack(msg, nlh, error);
-#endif
-	return nlmsg_len(nlh);
-#else
-	return error;
-#endif
-}
 
 #endif

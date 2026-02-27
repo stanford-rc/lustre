@@ -15,42 +15,6 @@
 #include "qsd_internal.h"
 
 /**
- * helper function bumping lqe_pending_req if there is no quota request in
- * flight for the lquota entry \a lqe. Otherwise, EBUSY is returned.
- */
-static inline int qsd_request_enter(struct lquota_entry *lqe)
-{
-	/* is there already a quota request in flight? */
-	if (lqe->lqe_pending_req != 0) {
-		LQUOTA_DEBUG(lqe, "already a request in flight");
-		return -EBUSY;
-	}
-
-	if (lqe->lqe_pending_rel != 0) {
-		LQUOTA_ERROR(lqe, "no request in flight with pending_rel=%llu",
-			     lqe->lqe_pending_rel);
-		LBUG();
-	}
-
-	lqe->lqe_pending_req++;
-	return 0;
-}
-
-/**
- * Companion of qsd_request_enter() dropping lqe_pending_req to 0.
- */
-static inline void qsd_request_exit(struct lquota_entry *lqe)
-{
-	if (lqe->lqe_pending_req != 1) {
-		LQUOTA_ERROR(lqe, "lqe_pending_req != 1!!!");
-		LBUG();
-	}
-	lqe->lqe_pending_req--;
-	lqe->lqe_pending_rel = 0;
-	wake_up(&lqe->lqe_waiters);
-}
-
-/**
  * Check whether a qsd instance is all set to send quota request to master.
  * This includes checking whether:
  * - the connection to master is set up and usable,
@@ -296,13 +260,10 @@ static inline bool qsd_adjust_needed(struct lquota_entry *lqe)
  * Callback function called when an acquire/release request sent to the master
  * is completed
  */
-static void qsd_req_completion(const struct lu_env *env,
-			       struct qsd_qtype_info *qqi,
-			       struct quota_body *reqbody,
-			       struct quota_body *repbody,
-			       struct lustre_handle *lockh,
-			       struct lquota_lvb *lvb,
-			       void *arg, int ret)
+void qsd_req_completion(const struct lu_env *env, struct qsd_qtype_info *qqi,
+			struct quota_body *reqbody, struct quota_body *repbody,
+			struct lustre_handle *lockh, struct lquota_lvb *lvb,
+			void *arg, int ret)
 {
 	struct lquota_entry	*lqe = (struct lquota_entry *)arg;
 	struct qsd_thread_info	*qti;
@@ -337,6 +298,11 @@ static void qsd_req_completion(const struct lu_env *env,
 				     ret, reqbody->qb_flags);
 		GOTO(out, ret);
 	}
+
+	if (repbody != NULL && repbody->qb_id.qid_uid == 0 &&
+	    repbody->qb_count == 0 && repbody->qb_usage == 0 &&
+	    repbody->qb_flags == QUOTA_DQACQ_FL_REPORT)
+		GOTO(out_noadjust, ret);
 
 	/* Set the lqe_lockh */
 	if (lustre_handle_is_used(lockh) &&
@@ -413,6 +379,18 @@ out_noadjust:
 	/* release reference on per-ID lock */
 	if (lustre_handle_is_used(lockh))
 		ldlm_lock_decref(lockh, qsd_id_einfo.ei_mode);
+
+	if (repbody != NULL) {
+		if (qqi->qqi_glb_ver == repbody->qb_glb_ver)
+			qqi->qqi_last_version_update_time = ktime_get_seconds();
+		else if (CFS_FAIL_CHECK(OBD_FAIL_QUOTA_DROP_VER_UPDATE) ||
+			 qqi->qqi_last_version_update_time <
+			 (ktime_get_seconds() -
+			  		qqi->qqi_qsd->qsd_ver_reint_timeout)) {
+			qqi->qqi_glb_uptodate = 0;
+			qsd_start_reint_thread(qqi);
+		}
+	}
 
 	if (cancel) {
 		qsd_adjust_schedule(lqe, false, true);
@@ -731,8 +709,6 @@ static int qsd_op_begin0(const struct lu_env *env, struct qsd_qtype_info *qqi,
 		/* lqe will be released in qsd_op_end() */
 	}
 
-	LQUOTA_DEBUG(lqe, "op_begin space: %lld", space);
-
 	if (space <= 0) {
 		/* when space is negative or null, we don't need to consume
 		 * quota space. That said, we still want to perform space
@@ -744,6 +720,8 @@ static int qsd_op_begin0(const struct lu_env *env, struct qsd_qtype_info *qqi,
 		}
 		RETURN(0);
 	}
+
+	LQUOTA_DEBUG(lqe, "op_begin space:%lld", space);
 
 	lqe_write_lock(lqe);
 	lqe->lqe_waiting_write += space;
@@ -921,13 +899,6 @@ int qsd_op_begin(const struct lu_env *env, struct qsd_instance *qsd,
 		trans->lqt_ids[i].lqi_type   = qi->lqi_type;
 		trans->lqt_ids[i].lqi_is_blk = qi->lqi_is_blk;
 		trans->lqt_id_cnt++;
-	}
-
-	if (qi->lqi_space < 0) {
-		if (found)
-			trans->lqt_ids[i].lqi_truncated_space += -qi->lqi_space;
-		else
-			trans->lqt_ids[i].lqi_truncated_space = -qi->lqi_space;
 	}
 
 	/* manage quota enforcement for this ID */
@@ -1110,27 +1081,6 @@ static void qsd_op_end0(const struct lu_env *env, struct qsd_qtype_info *qqi,
 			/* no suitable environment, handle adjustment in
 			 * separate thread context */
 			qsd_adjust_schedule(lqe, false, false);
-	}
-
-	/* Currently, ZFS will call qsd_op_end->qsd_op_end0 with env = NULL,
-	 * but ZFS will update the quota after commit, then it doesn't need
-	 * to wait to adjust the quota usage (LU-19068).
-	 */
-	if (!CFS_FAIL_CHECK(OBD_FAIL_QUOTA_USAGE_NOWAIT) &&
-	    env && qid->lqi_truncated_space > 1048576) {
-		__u32 seconds;
-
-		/* one second per gigabyte */
-		seconds = qid->lqi_truncated_space >> 20;
-		if (seconds > 120)
-			seconds = 120;
-
-		lqe_write_lock(lqe);
-		if (lqe->lqe_truncated_time < seconds + ktime_get_seconds())
-			lqe->lqe_truncated_time = seconds + ktime_get_seconds();
-		lqe_write_unlock(lqe);
-
-		qsd_adjust_schedule(lqe, true, false);
 	}
 	lqe_putref(lqe);
 	EXIT;

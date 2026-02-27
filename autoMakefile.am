@@ -14,6 +14,7 @@ SUBDIRS := @LDISKFS_SUBDIR@ \
 	. \
 	@LUSTREIOKIT_SUBDIR@ \
 	Documentation \
+	lib \
 	libcfs \
 	lnet \
 	lustre
@@ -21,6 +22,7 @@ SUBDIRS := @LDISKFS_SUBDIR@ \
 DIST_SUBDIRS := ldiskfs \
 	lustre-iokit \
 	Documentation \
+	lib \
 	libcfs \
 	lnet \
 	lustre \
@@ -177,7 +179,9 @@ undef.h: config.h.in
 dist-hook: undef.h
 	find include/ -type f \( -name "*.h" \) \
 		-exec cp --parents {} $(distdir) \;
-	find lustre_compat/ -type f \( -name "*.c" -o -iname "Makefile" \) \
+	find lustre_compat/ -type f \( -name "*.c" -o -name "*.h" -o -iname "Makefile" \) \
+		-exec cp --parents {} $(distdir) \;
+	find lustre/ -type f \( -name "*.c" -o -name "*.h" -o -iname "Makefile" \) \
 		-exec cp --parents {} $(distdir) \;
 	find $(distdir) -name .deps -o \
 			-name CVS -o \
@@ -198,6 +202,11 @@ EXTRA_DIST = @PACKAGE_TARNAME@.spec	\
 	autogen.sh			\
 	modules.order			\
 	config/lustre-version.m4
+
+# Find Lustre kernel modules
+modulefs_DATA = $(shell find lustre/ -name *.ko)
+modulefs_DATA += $(shell find ldiskfs/ -name *.ko)
+EXTRA_DIST += $(modulefs_DATA)
 
 # contrib is a directory.  Putting a directory in EXTRA_DIST
 # recursively includes the entire directory contents in the
@@ -345,7 +354,7 @@ debs: undef.h debs_common
 	lversion=$$(echo @VERSION@ | tr '_' '-'); \
 	cversion=$$(sed -ne '1s/^lustre (\(.*\)-[0-9][0-9]*).*$$/\1/p' debian/changelog); \
 	if [ "$$lversion" != "$$cversion" ]; then \
-		echo -e "1i\nlustre ($$lversion-1) unstable; urgency=low\n\n  * Automated changelog entry update\n\n -- Andreas Dilger <adilger@thelustrecollective.com>  $$(date -r)\n\n.\nwq" | ed debian/changelog; \
+		sed -i "1i lustre ($$lversion-1) unstable; urgency=low\n\n  * Automated changelog entry update\n\n -- Andreas Dilger <adilger@thelustrecollective.com>  $$(date -R)" debian/changelog; \
 	fi; \
 	rm -rf debs; \
 	if test "x@ENABLE_SERVER@" = "xyes"; then \
@@ -590,7 +599,7 @@ dkms-debs: undef.h debs_common
 	lversion=$$(echo @VERSION@ | tr '_' '-'); \
 	cversion=$$(sed -ne '1s/^lustre (\(.*\)-[0-9][0-9]*).*$$/\1/p' debian/changelog); \
 	if [ "$$lversion" != "$$cversion" ]; then \
-		echo -e "1i\nlustre ($$lversion-1) unstable; urgency=low\n\n  * Automated changelog entry update\n\n -- Brian J. Murrell <brian@interlinx.bc.ca>  $$(date -R)\n\n.\nwq" | ed debian/changelog; \
+		sed -i "1i lustre ($$lversion-1) unstable; urgency=low\n\n  * Automated changelog entry update\n\n -- Andreas Dilger <adilger@thelustrecollective.com> $$(date -R)" debian/changelog; \
 	fi; \
 	rm -rf debs; \
 	export DEB_BUILD_PROFILES="client"; \

@@ -926,7 +926,8 @@ struct ptlrpc_body_v2 {
 				OBD_CONNECT2_DMV_IMP_INHERIT |\
 				OBD_CONNECT2_UNALIGNED_DIO | \
 				OBD_CONNECT2_PCCRO | \
-				OBD_CONNECT2_MIRROR_ID_FIX)
+				OBD_CONNECT2_MIRROR_ID_FIX |\
+				OBD_CONNECT2_READDIR_OPEN)
 
 #define OST_CONNECT_SUPPORTED  (OBD_CONNECT_SRVLOCK | OBD_CONNECT_GRANT | \
 				OBD_CONNECT_VERSION | OBD_CONNECT_INDEX | \
@@ -1650,7 +1651,8 @@ struct quota_body {
 	__u64		qb_slv_ver; /* slave index file version */
 	struct lustre_handle	qb_lockh;     /* per-ID lock handle */
 	struct lustre_handle	qb_glb_lockh; /* global lock handle */
-	__u64		qb_padding1[4];
+	__u64		qb_glb_ver; /* global index file version */
+	__u64		qb_padding1[3];
 };
 
 /* When the quota_body is used in the reply of quota global intent
@@ -2095,6 +2097,7 @@ enum mds_op_bias {
 	/* Compat flag with clients that do not send old and new data version
 	 * after swap layout */
 	MDS_CLOSE_LAYOUT_SWAP_HSM	= 1 << 25,
+	MDS_NAMEHASH		= 1 << 26,
 };
 
 #define MDS_CLOSE_INTENT (MDS_HSM_RELEASE | MDS_CLOSE_LAYOUT_SWAP |         \

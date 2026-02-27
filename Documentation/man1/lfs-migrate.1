@@ -1,10 +1,17 @@
-.TH LFS-MIGRATE 1 2025-05-23 Lustre "Lustre User Utilities"
+.TH LFS-MIGRATE 1 2025-12-20 Lustre "Lustre User Utilities"
 .SH NAME
 lfs-migrate \- migrate files or directories between MDTs or OSTs.
 .SH SYNOPSIS
 .SY "lfs migrate"
 .RB [ -h ]
 .RB [ -v ]
+.RB [ -A
+.RB [ -K
+.IR CAP ]
+.RB [ -M
+.IR MIN_FREE ]
+.RB [ -X
+.I MAX_FREE ]]
 .RI [ SETSTRIPE_OPTIONS " ... ]"
 .IR FILES_FROM
 .SY "lfs migrate"
@@ -68,13 +75,31 @@ will copy the data from the existing file(s) using the new layout parameters
 to the new OST(s). In contrast,
 .B lfs setstripe
 is used for creating new (empty) files with the specified layout.
-For OST object migration, there additional options available:
+For OST object migration, there are additional options available:
 .PP
 If setstripe is restricted to specified users, this also applies to
 .B lfs migrate.
 See
 .BR lfs-setstripe (1)
 for details.
+.TP
+.B -A
+Automatically determine the stripe count for the file, using the algorithm
+count = sqrt(filesize_in_GB) + 1. This option may not be specified at the
+same time as the
+.B -c
+or
+.B -R
+options.
+.TP
+.BI -K " CAP"
+When
+.B -A
+is set, limit the migrated file to use on each OST at most
+.RI 1/ CAP
+of the available space of the smallest OST. If this option is not
+set, a default value of 100 is used, limiting the object size to 1% of available
+space.
 .TP
 .BR -b ", " --block
 Block access to the file by other applications during data migration
@@ -118,6 +143,23 @@ The mount point of Lustre file system on which FIDs are.
 If there is only one mounted Lustre file system, this option is not necessary.
 This option must be specified together with
 .BR --fid .
+.TP
+.BR -M ", " --min-free \fIMIN_FREE
+When
+.B -A
+is set, only consider OSTs with free space greater than the
+.I MIN_FREE
+value to be available for migration. The value is specified in
+KB. If this option is not set, a default of 256MB is used.
+.TP
+.BR -X ", " --max-free \fIMAX_FREE
+When
+.B -A
+is set,
+.I MAX_FREE
+is the maximum amount of free space that can be considered available
+for the migration of the file on each OST. The value is specified in KB.
+This option is useful for testing, by simulating OSTs that are nearly full.
 .TP
 .BR -n ", " --non-block
 Abort migration if concurrent file access is detected. This can be
@@ -193,6 +235,20 @@ values are specified in a comma-separated list, then the number of specified
 .I MDT_INDEX
 values must match
 .IR COUNT .
+.TP
+.BR -C ", " --mdt-overcount= \fICOUNT
+The number of directory stripes to create, creating > 1 stripe per MDT if
+.I COUNT
+exceeds the number of MDTs in the file system.
+.B 0
+means to use the filesystem-wide default stripe count (default 1), and
+.B range -1 to -5
+means to stripe over all available MDTs in multiple of MDT count. For example,
+.B -1
+means one stripe per MDT,
+.B -2
+means two stripes per MDT, and so on. The maximum is 5 stripes per MDT.
+This allows a single directory to more fully use the capability of each MDT.
 .TP
 .BR -d ", " --directory
 Only migrate the specified
@@ -272,6 +328,24 @@ into a new layout with 2 stripes:
 .RE
 .EE
 .PP
+This migrates
+.B file2
+using automatic striping (stripe count calculated based on file size):
+.EX
+.RS
+.B # lfs migrate -A /mnt/lustre/file2
+.RE
+.EE
+.PP
+This migrates
+.B file3
+using automatic striping with custom capacity limits (5% of OST space):
+.EX
+.RS
+.B # lfs migrate -A -K 20 /mnt/lustre/file3
+.RE
+.EE
+.PP
 This migrates the data in
 .B file2
 into a three component composite layout (number of stripes depends on
@@ -339,10 +413,10 @@ command is part of the
 filesystem package since release 2.4.0
 .\" lfs_setstripe_migrate added in commit v2_3_63_0-6-gead6f5b2b5)
 .SH SEE ALSO
+.BR lctl (8),
 .BR lfs (1),
 .BR lfs-getdirstripe (1),
 .BR lfs_migrate (1),
 .BR lfs-mkdir (1),
 .BR lfs-setdirstripe (1),
-.BR lfs-setstripe (1),
-.BR lctl (8)
+.BR lfs-setstripe (1)

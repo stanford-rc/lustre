@@ -95,15 +95,8 @@ ksocknal_lib_sendpage(struct socket *sock, struct bio_vec *kiov,
 {
 #ifdef MSG_SPLICE_PAGES
 	struct msghdr msg = {.msg_flags = msgflg | MSG_SPLICE_PAGES};
-	int i;
 
 	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, kiov, 1, kiov->bv_len);
-	for (i = 0; i < nkiov; i++) {
-		if (!sendpage_ok(kiov[i].bv_page)) {
-			msg.msg_flags &= ~MSG_SPLICE_PAGES;
-			break;
-		}
-	}
 
 	return sock_sendmsg(sock, &msg);
 #else
@@ -576,11 +569,7 @@ void ksocknal_write_callback(struct ksock_conn *conn);
  * socket call back in Linux
  */
 static void
-#ifdef HAVE_SK_DATA_READY_ONE_ARG
 ksocknal_data_ready(struct sock *sk)
-#else
-ksocknal_data_ready(struct sock *sk, int n)
-#endif
 {
 	struct ksock_conn  *conn;
 
@@ -591,11 +580,7 @@ ksocknal_data_ready(struct sock *sk, int n)
 	conn = sk->sk_user_data;
 	if (conn == NULL) {	/* raced with ksocknal_terminate_conn */
 		LASSERT(sk->sk_data_ready != &ksocknal_data_ready);
-#ifdef HAVE_SK_DATA_READY_ONE_ARG
 		sk->sk_data_ready(sk);
-#else
-		sk->sk_data_ready(sk, n);
-#endif
 	} else
 		ksocknal_read_callback(conn);
 

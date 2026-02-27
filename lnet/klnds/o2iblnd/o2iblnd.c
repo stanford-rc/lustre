@@ -3208,7 +3208,7 @@ kiblnd_handle_link_state_change(struct net_device *dev,
 		if (link_down) {
 			ni_state_before = lnet_set_link_fatal_state(ni, 1);
 		} else {
-			state = (lnet_get_link_status(dev) == 0);
+			state = (lnet_get_link_status_locked(dev) == 0);
 			ni_state_before = lnet_set_link_fatal_state(ni,
 								    state);
 		}
@@ -3446,8 +3446,6 @@ kiblnd_shutdown(struct lnet_ni *ni)
 				       libcfs_nidstr(&ni->ni_nid),
 				       atomic_read(&net->ibn_npeers));
 
-		kiblnd_net_fini_pools(net);
-
 		write_lock_irqsave(g_lock, flags);
 		LASSERT(net->ibn_dev->ibd_nnets > 0);
 		net->ibn_dev->ibd_nnets--;
@@ -3460,6 +3458,7 @@ kiblnd_shutdown(struct lnet_ni *ni)
 				       "%s: waiting for %d conns to clean\n",
 				       libcfs_nidstr(&ni->ni_nid),
 				       atomic_read(&net->ibn_nconns));
+		kiblnd_net_fini_pools(net);
 		fallthrough;
 
 	case IBLND_INIT_NOTHING:

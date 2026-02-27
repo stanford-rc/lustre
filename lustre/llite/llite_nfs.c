@@ -281,36 +281,21 @@ do_nfs_get_name_filldir(struct ll_getname_data *lgd, const char *name,
 	return lgd->lgd_found;
 }
 
+static FILLDIR_TYPE
+ll_nfs_get_name_filldir(struct dir_context *ctx, const char *name, int namelen,
+			loff_t hash, u64 ino, unsigned int type)
+{
+	struct ll_getname_data *lgd =
+		container_of(ctx, struct ll_getname_data, ctx);
+	int err;
+
+	err = do_nfs_get_name_filldir(lgd, name, namelen, hash, ino, type);
 #ifdef HAVE_FILLDIR_USE_CTX_RETURN_BOOL
-static bool
-ll_nfs_get_name_filldir(struct dir_context *ctx, const char *name, int namelen,
-			loff_t hash, u64 ino, unsigned int type)
-{
-	struct ll_getname_data *lgd =
-		container_of(ctx, struct ll_getname_data, ctx);
-	int err = do_nfs_get_name_filldir(lgd, name, namelen, hash, ino, type);
-
 	return err == 0;
-}
-#elif defined(HAVE_FILLDIR_USE_CTX)
-static int
-ll_nfs_get_name_filldir(struct dir_context *ctx, const char *name, int namelen,
-			loff_t hash, u64 ino, unsigned int type)
-{
-	struct ll_getname_data *lgd =
-		container_of(ctx, struct ll_getname_data, ctx);
-
-	return do_nfs_get_name_filldir(lgd, name, namelen, hash, ino, type);
-}
 #else
-static int ll_nfs_get_name_filldir(void *cookie, const char *name, int namelen,
-				   loff_t hash, u64 ino, unsigned int type)
-{
-	struct ll_getname_data *lgd = cookie;
-
-	return do_nfs_get_name_filldir(lgd, name, namelen, hash, ino, type);
+	return err;
+#endif
 }
-#endif /* HAVE_FILLDIR_USE_CTX */
 
 static int ll_get_name(struct dentry *dentry, char *name, struct dentry *child)
 {
@@ -318,9 +303,7 @@ static int ll_get_name(struct dentry *dentry, char *name, struct dentry *child)
 	struct ll_getname_data lgd = {
 		.lgd_name = name,
 		.lgd_fid = ll_i2info(child->d_inode)->lli_fid,
-#ifdef HAVE_DIR_CONTEXT
 		.ctx.actor = (filldir_t)ll_nfs_get_name_filldir,
-#endif
 		.lgd_found = 0,
 	};
 	struct md_op_data *op_data;
@@ -341,12 +324,7 @@ static int ll_get_name(struct dentry *dentry, char *name, struct dentry *child)
 		GOTO(out, rc = PTR_ERR(op_data));
 
 	inode_lock(dir);
-#ifdef HAVE_DIR_CONTEXT
 	rc = ll_dir_read(dir, &pos, op_data, &lgd.ctx, NULL);
-#else
-	rc = ll_dir_read(dir, &pos, op_data, &lgd, ll_nfs_get_name_filldir,
-			 NULL);
-#endif
 	inode_unlock(dir);
 	ll_finish_md_op_data(op_data);
 	if (!rc && !lgd.lgd_found)

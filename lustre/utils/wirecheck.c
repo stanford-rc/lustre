@@ -1232,6 +1232,8 @@ check_mds_op_bias(void)
 	CHECK_VALUE_X(MDS_FID_OP);
 	CHECK_VALUE_X(MDS_MIGRATE_NSONLY);
 	CHECK_VALUE_X(MDS_CREATE_DEFAULT_LMV);
+	CHECK_VALUE_X(MDS_CLOSE_LAYOUT_SWAP_HSM);
+	CHECK_VALUE_X(MDS_NAMEHASH);
 }
 
 static void
@@ -2080,6 +2082,7 @@ check_rsc_downcall_data(void)
 	CHECK_MEMBER(rsc_downcall_data, scd_uid);
 	CHECK_MEMBER(rsc_downcall_data, scd_gid);
 	CHECK_MEMBER(rsc_downcall_data, scd_mechname);
+	CHECK_MEMBER(rsc_downcall_data, scd_nmname);
 	CHECK_MEMBER(rsc_downcall_data, scd_offset);
 	CHECK_MEMBER(rsc_downcall_data, scd_len);
 	CHECK_MEMBER(rsc_downcall_data, scd_padding);

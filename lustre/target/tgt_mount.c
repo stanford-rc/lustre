@@ -19,7 +19,7 @@
 #define D_MOUNT (D_SUPER | D_CONFIG /* | D_WARNING */)
 
 #include <linux/types.h>
-#include <lustre_compat/linux/generic-radix-tree.h>
+#include <linux/generic-radix-tree.h>
 #ifdef HAVE_LINUX_SELINUX_IS_ENABLED
 #include <linux/selinux.h>
 #endif
@@ -1209,7 +1209,8 @@ static int server_nid2radix(void *data, struct lnet_nid *nid)
 	if (nid_is_lo0(nid))
 		return 0;
 
-	if (test_bit(LMD_FLG_NO_PRIMNODE, nfd->nfd_lmd->lmd_flags) &&
+	if (nfd->nfd_lmd &&
+	    test_bit(LMD_FLG_NO_PRIMNODE, nfd->nfd_lmd->lmd_flags) &&
 	    class_match_nid(nfd->nfd_lmd->lmd_params, PARAM_FAILNODE, nid) < 1)
 		return 0;
 
@@ -1267,7 +1268,7 @@ static struct mgs_target_info *server_lsi2mti(struct lustre_sb_info *lsi,
 	genradix_init(&nfd.nfd_radix);
 	/* avoid allocation inside callback */
 	genradix_prealloc(&nfd.nfd_radix, MTI_NIDS_MAX, GFP_KERNEL);
-	nfd.nfd_lmd = lsi->lsi_lmd;
+	nfd.nfd_lmd = registration ? lsi->lsi_lmd : NULL;
 	nfd.nfd_pos = 0;
 
 	LNetFetchNIDs(server_nid2radix, refnet, &nfd);
@@ -1468,9 +1469,9 @@ struct tgt_notifier_work {
  * Notify the MGS that this target has new NIDs configured.
  */
 static int tgt_nids_notify(struct lustre_sb_info *lsi,
-			   struct tgt_notifier_work *tnw)
+			   struct mgs_target_info *mti,
+			   struct ptlrpc_request_set *set)
 {
-	struct mgs_target_info *mti = &tnw->tnw_mti;
 	struct obd_device *mgc = lsi->lsi_mgc, *obd;
 	int mti_len = sizeof(*mti) + NIDLIST_SIZE(mti->mti_nid_count);
 	const char *tgt;
@@ -1509,9 +1510,98 @@ static int tgt_nids_notify(struct lustre_sb_info *lsi,
 
 	rc = obd_set_info_async(NULL, mgc->u.cli.cl_mgc_mgsexp,
 				sizeof(KEY_NID_NOTIFY), KEY_NID_NOTIFY,
-				mti_len, mti, NULL);
+				mti_len, mti, set);
 
 	return rc;
+}
+
+/**
+ * This function is used as an upcall-callback from MGC to get re-connection
+ * notification and notify MGS about local NIDs to rebuild NID table
+ */
+static void tgt_import_update(struct work_struct *ws)
+{
+	struct delayed_work *dw;
+	struct lustre_sb_info *lsi;
+	struct mgs_target_info *mti = NULL;
+	size_t mti_len = sizeof(*mti);
+	struct nid_fetch_data nfd;
+	struct ptlrpc_request_set *set;
+	int i;
+	int rc;
+
+	ENTRY;
+
+	dw = container_of(ws, struct delayed_work, work);
+
+	/* get local NIDs just once, it is the same for local targets.
+	 * tgt_nids_notify() fills target-specific data from lsi
+	 */
+	genradix_init(&nfd.nfd_radix);
+	/* avoid allocation inside callback */
+	genradix_prealloc(&nfd.nfd_radix, MTI_NIDS_MAX, GFP_KERNEL);
+	nfd.nfd_lmd = NULL;
+	nfd.nfd_pos = 0;
+
+	LNetFetchNIDs(server_nid2radix, LNET_NET_ANY, &nfd);
+	if (nfd.nfd_pos == 0) {
+		rc = -ENETDOWN;
+		CWARN("MGC: can't get local NIDs from LNet, rc = %d\n", rc);
+		GOTO(free_radix, rc);
+	}
+
+	mti_len += NIDLIST_SIZE(nfd.nfd_pos);
+	OBD_ALLOC(mti, mti_len);
+	if (!mti)
+		GOTO(free_radix, rc = -ENOMEM);
+	mti->mti_nid_count = nfd.nfd_pos;
+	for (i = 0; i < mti->mti_nid_count; i++) {
+		struct lnet_nid *nid = genradix_ptr(&nfd.nfd_radix, i);
+
+		libcfs_nidstr_r(nid, mti->mti_nidlist[i],
+				sizeof(mti->mti_nidlist[i]));
+		CDEBUG(D_CONFIG, "NID #%d: %s\n", i, mti->mti_nidlist[i]);
+	}
+
+	set = ptlrpc_prep_set();
+	if (!set)
+		GOTO(free_mti, rc = -ENOMEM);
+
+	down_read(&tgt_nu_lock);
+	list_for_each_entry(lsi, &tgt_nu_list, lsi_notifier_link) {
+		rc = tgt_nids_notify(lsi, mti, set);
+		CDEBUG(D_CONFIG, "%s: notify about %d NIDs, rc = %d\n",
+		       lsi->lsi_svname, mti->mti_nid_count, rc);
+	}
+	up_read(&tgt_nu_lock);
+
+	ptlrpc_set_wait(NULL, set);
+	ptlrpc_set_destroy(set);
+
+free_mti:
+	OBD_FREE(mti, mti_len);
+free_radix:
+	genradix_free(&nfd.nfd_radix);
+	OBD_FREE_PTR(dw);
+}
+
+static int tgt_import_active_cb(struct obd_device *host,
+				struct obd_device *watched,
+				enum obd_notify_event ev, void *owner)
+{
+	struct delayed_work *dw;
+
+	if (ev != OBD_NOTIFY_ACTIVE)
+		return 0;
+
+	OBD_ALLOC_PTR(dw);
+	if (!dw)
+		RETURN(-ENOMEM);
+
+	INIT_DELAYED_WORK(dw, tgt_import_update);
+	queue_delayed_work(tgt_nu_wq, dw, 0);
+
+	return 0;
 }
 
 static void tgt_nid_notifier(struct work_struct *ws)
@@ -1524,7 +1614,7 @@ static void tgt_nid_notifier(struct work_struct *ws)
 
 	down_read(&tgt_nu_lock);
 	list_for_each_entry(lsi, &tgt_nu_list, lsi_notifier_link) {
-		rc = tgt_nids_notify(lsi, tnw);
+		rc = tgt_nids_notify(lsi, &tnw->tnw_mti, NULL);
 		CDEBUG(D_CONFIG, "%s: queue update for %d new NIDs, rc = %d\n",
 		       lsi->lsi_svname, tnw->tnw_mti.mti_nid_count, rc);
 	}
@@ -1589,6 +1679,7 @@ static int tgt_del_notifier(struct lustre_sb_info *lsi)
 
 		if (tgt_nu_wq) {
 			LNetUnRegisterNIDUpdates(&tgt_nu_wq);
+			lsi->lsi_mgc->obd_upcall.onu_upcall = NULL;
 			destroy_workqueue(tgt_nu_wq);
 			tgt_nu_wq = NULL;
 		}
@@ -1620,6 +1711,8 @@ static int tgt_add_notifier(struct lustre_sb_info *lsi)
 			      lsi->lsi_svname, rc);
 			GOTO(fail_reg, rc);
 		}
+		lsi->lsi_mgc->obd_upcall.onu_owner = NULL;
+		lsi->lsi_mgc->obd_upcall.onu_upcall = tgt_import_active_cb;
 	}
 
 	list_add_tail(&lsi->lsi_notifier_link, &tgt_nu_list);
@@ -2129,6 +2222,9 @@ static int server_show_options(struct seq_file *seq, struct dentry *dentry)
 	if (test_bit(LMD_FLG_MGS, lmd->lmd_flags))
 		seq_puts(seq, ",mgs");
 
+	if (test_bit(LMD_FLG_NO_RCLNT, lmd->lmd_flags))
+		seq_puts(seq, ",noclient");
+
 	if (lmd->lmd_mgs)
 		seq_printf(seq, ",mgsnode=%s", lmd->lmd_mgs);
 
@@ -2233,6 +2329,10 @@ static bool is_cmd_supported(unsigned int cmd)
 	case FS_IOC_GETFSMAP:
 		return true;
 #endif
+	case FS_IOC_GETFSLABEL:
+		return true;
+	case FS_IOC_SETFSLABEL:
+		return true;
 	default:
 		return false;
 	}
@@ -2570,8 +2670,7 @@ void server_calc_timeout(struct lustre_sb_info *lsi, struct obd_device *obd)
  * and this is where we start setting things up.
  * @param data Mount options (e.g. -o flock,abort_recov)
  */
-static int lustre_tgt_fill_super(struct super_block *sb, void *lmd2_data,
-				 int silent)
+static int lustre_tgt_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct lustre_mount_data *lmd;
 	struct lustre_sb_info *lsi;
@@ -2580,7 +2679,7 @@ static int lustre_tgt_fill_super(struct super_block *sb, void *lmd2_data,
 	ENTRY;
 	CDEBUG(D_MOUNT|D_VFSTRACE, "VFS Op: sb %p\n", sb);
 
-	lsi = lustre_init_lsi(sb);
+	lsi = lustre_init_lsi(fc, sb);
 	if (!lsi)
 		RETURN(-ENOMEM);
 	lmd = lsi->lsi_lmd;
@@ -2595,12 +2694,6 @@ static int lustre_tgt_fill_super(struct super_block *sb, void *lmd2_data,
 	 * LU-639: the OBD cleanup of last mount may not finish yet, wait here.
 	 */
 	obd_zombie_barrier();
-
-	/* Figure out the lmd from the mount options */
-	if (lmd_parse(lmd2_data, lmd)) {
-		lustre_put_lsi(sb);
-		GOTO(out, rc = -EINVAL);
-	}
 
 	if (lmd_is_client(lmd)) {
 		rc = -ENODEV;
@@ -2635,11 +2728,29 @@ out:
 }
 
 /***************** FS registration ******************/
-static struct dentry *lustre_tgt_mount(struct file_system_type *fs_type,
-				       int flags, const char *devname,
-				       void *data)
+static int lustre_tgt_get_tree(struct fs_context *fc)
 {
-	return mount_nodev(fs_type, flags, data, lustre_tgt_fill_super);
+	return get_tree_nodev(fc, lustre_tgt_fill_super);
+}
+
+static const struct fs_context_operations lustre_tgt_fs_context_ops = {
+	.parse_monolithic	= lustre_parse_monolithic,
+	.get_tree		= lustre_tgt_get_tree,
+	.free			= lustre_fc_free,
+};
+
+static int lustre_tgt_init_fs_context(struct fs_context *fc)
+{
+	struct lustre_mount_data *lmd;
+
+	OBD_ALLOC_PTR(lmd);
+	if (!lmd)
+		return -ENOMEM;
+
+	kref_init(&lmd->lmd_ref);
+	fc->fs_private = lmd;
+	fc->ops = &lustre_tgt_fs_context_ops;
+	return 0;
 }
 
 /* Register the "lustre_tgt" fs type.
@@ -2653,11 +2764,11 @@ static struct dentry *lustre_tgt_mount(struct file_system_type *fs_type,
  * The long-term goal is to disentangle the client and server mount code.
  */
 static struct file_system_type lustre_tgt_fstype = {
-	.owner		= THIS_MODULE,
-	.name		= "lustre_tgt",
-	.mount		= lustre_tgt_mount,
-	.kill_sb	= kill_anon_super,
-	.fs_flags	= FS_REQUIRES_DEV | FS_RENAME_DOES_D_MOVE,
+	.owner			= THIS_MODULE,
+	.name			= "lustre_tgt",
+	.init_fs_context	= lustre_tgt_init_fs_context,
+	.kill_sb		= kill_anon_super,
+	.fs_flags		= FS_REQUIRES_DEV | FS_RENAME_DOES_D_MOVE,
 };
 MODULE_ALIAS_FS("lustre_tgt");
 

@@ -105,40 +105,33 @@ const struct super_operations lustre_super_operations = {
 	.put_super     = ll_put_super,
 	.statfs        = ll_statfs,
 	.umount_begin  = ll_umount_begin,
-	.remount_fs    = ll_remount_fs,
 	.show_options  = ll_show_options,
 	.show_devname  = ll_show_devname,
 };
 
 /**
  * lustre_fill_super() - set up the superblock with lustre info
- *
  * @sb: setup superblock struct with lustre info
- * @lmd2_data: data Mount options provided during mount
- * (e.g. -o flock,abort_recov)
- * @silent:
+ * @fc: Pointer to struct fs_context
  *
  * This is the entry point for the mount call into Lustre.
  * This is called when a client is mounted, and this is
  * where we start setting things up.
  *
  * Returns:
- * * %0  Success
- * * <0 Error
- *
+ * * %0 Success
+ * * %negative Error
  */
-static int lustre_fill_super(struct super_block *sb, void *lmd2_data,
-			     int silent)
+static int lustre_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct lustre_mount_data *lmd;
 	struct lustre_sb_info *lsi;
 	int rc;
 
 	ENTRY;
-
 	CDEBUG(D_MOUNT|D_VFSTRACE, "VFS Op: sb %p\n", sb);
 
-	lsi = lustre_init_lsi(sb);
+	lsi = lustre_init_lsi(fc, sb);
 	if (!lsi)
 		RETURN(-ENOMEM);
 	lmd = lsi->lsi_lmd;
@@ -153,12 +146,6 @@ static int lustre_fill_super(struct super_block *sb, void *lmd2_data,
 	 * LU-639: the OBD cleanup of last mount may not finish yet, wait here.
 	 */
 	obd_zombie_barrier();
-
-	/* Figure out the lmd from the mount options */
-	if (lmd_parse(lmd2_data, lmd)) {
-		lustre_put_lsi(sb);
-		GOTO(out, rc = -EINVAL);
-	}
 
 	if (!lmd_is_client(lmd)) {
 #ifdef HAVE_SERVER_SUPPORT
@@ -206,10 +193,71 @@ out:
 }
 
 /***************** FS registration ******************/
-static struct dentry *lustre_mount(struct file_system_type *fs_type, int flags,
-				   const char *devname, void *data)
+static int lustre_get_tree(struct fs_context *fc)
 {
-	return mount_nodev(fs_type, flags, data, lustre_fill_super);
+	return get_tree_nodev(fc, lustre_fill_super);
+}
+
+static int lustre_reconfigure(struct fs_context *fc)
+{
+	struct super_block *sb = fc->root->d_sb;
+	char *profilenm = get_profile_name(sb);
+	struct lustre_sb_info *lsi = s2lsi(sb);
+	struct ll_sb_info *sbi = ll_s2sbi(sb);
+	u32 read_only;
+
+	sync_filesystem(sb);
+
+	if ((fc->sb_flags & SB_RDONLY) != (sb->s_flags & SB_RDONLY)) {
+		int err;
+
+		read_only = fc->sb_flags & SB_RDONLY;
+		err = obd_set_info_async(NULL, sbi->ll_md_exp,
+					sizeof(KEY_READ_ONLY),
+					 KEY_READ_ONLY, sizeof(read_only),
+					 &read_only, NULL);
+		if (err) {
+			LCONSOLE_WARN("Failed to remount %s %s (%d)\n",
+				      profilenm, read_only ?
+				      "read-only" : "read-write", err);
+			return err;
+		}
+
+		if (read_only)
+			sb->s_flags |= SB_RDONLY;
+		else
+			sb->s_flags &= ~SB_RDONLY;
+
+		if (test_bit(LL_SBI_VERBOSE, sbi->ll_flags))
+			LCONSOLE_WARN("Remounted %s %s\n", profilenm,
+				      read_only ?  "read-only" : "read-write");
+	}
+
+	/* Support a rewmount with new mount options. */
+	swap(lsi->lsi_lmd, fc->fs_private);
+
+	return 0;
+}
+
+static const struct fs_context_operations lustre_fs_context_ops = {
+	.parse_monolithic	= lustre_parse_monolithic,
+	.reconfigure		= lustre_reconfigure,
+	.get_tree		= lustre_get_tree,
+	.free			= lustre_fc_free,
+};
+
+static int lustre_init_fs_context(struct fs_context *fc)
+{
+	struct lustre_mount_data *lmd;
+
+	OBD_ALLOC_PTR(lmd);
+	if (!lmd)
+		return -ENOMEM;
+
+	kref_init(&lmd->lmd_ref);
+	fc->fs_private = lmd;
+	fc->ops = &lustre_fs_context_ops;
+	return 0;
 }
 
 static void lustre_kill_super(struct super_block *sb)
@@ -224,11 +272,11 @@ static void lustre_kill_super(struct super_block *sb)
 
 /* Register the "lustre" fs type */
 static struct file_system_type lustre_fs_type = {
-	.owner		= THIS_MODULE,
-	.name		= "lustre",
-	.mount		= lustre_mount,
-	.kill_sb	= lustre_kill_super,
-	.fs_flags	= FS_RENAME_DOES_D_MOVE,
+	.owner			= THIS_MODULE,
+	.name			= "lustre",
+	.init_fs_context	= lustre_init_fs_context,
+	.kill_sb		= lustre_kill_super,
+	.fs_flags		= FS_RENAME_DOES_D_MOVE,
 };
 MODULE_ALIAS_FS("lustre");
 
@@ -343,6 +391,11 @@ static void __exit lustre_exit(void)
 	kmem_cache_destroy(pcc_inode_slab);
 	kmem_cache_destroy(quota_iter_slab);
 }
+
+unsigned int llite_enable_flr_ec = 1;
+module_param(llite_enable_flr_ec, uint, 0644);
+MODULE_PARM_DESC(llite_enable_flr_ec,
+		 "enable FLR EC connect flag, on by default");
 
 MODULE_AUTHOR("OpenSFS, Inc. <http://www.lustre.org/>");
 MODULE_DESCRIPTION("Lustre Client File System");

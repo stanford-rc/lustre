@@ -48,10 +48,6 @@
 
 #include <linux/lnet/nidstr.h>
 #include <linux/lnet/lnetctl.h>
-#ifdef HAVE_SERVER_SUPPPORT
-#include <linux/lustre/lustre_barrier_user.h>
-#include <linux/lustre/lustre_disk.h>
-#endif
 #include <linux/lustre/lustre_cfg.h>
 #include <linux/lustre/lustre_ioctl.h>
 #include <linux/lustre/lustre_ostid.h>
@@ -778,48 +774,6 @@ int jt_opt_net(int argc, char **argv)
 #define OBD_IOC_NO_TRANSNO	_IOW('f', 140, OBD_IOC_DATA_TYPE)
 #endif
 
-static bool is_mgs(void)
-{
-	glob_t path;
-	int rc;
-
-	rc = cfs_get_param_paths(&path, "mgs/MGS/exports");
-	if (!rc) {
-		cfs_free_param_data(&path);
-		return true;
-	}
-
-	return false;
-}
-
-static bool is_mds(void)
-{
-	glob_t path;
-	int rc;
-
-	rc = cfs_get_param_paths(&path, "mdt/*-MDT*/exports");
-	if (!rc) {
-		cfs_free_param_data(&path);
-		return true;
-	}
-
-	return false;
-}
-
-static bool is_oss(void)
-{
-	glob_t path;
-	int rc;
-
-	rc = cfs_get_param_paths(&path, "obdfilter/*-OST*/exports");
-	if (!rc) {
-		cfs_free_param_data(&path);
-		return true;
-	}
-
-	return false;
-}
-
 static int get_mds_device(void)
 {
 	char mds[] = "$MDS";
@@ -827,6 +781,27 @@ static int get_mds_device(void)
 
 	do_disconnect(NULL, 1);
 	rc = do_device("mdsioc", mds);
+	if (rc) {
+		errno = ENODEV;
+		return -errno;
+	}
+	return cur_device;
+}
+
+static int get_qmt_device(const char *fsname)
+{
+	static const char postfix[] = "-QMT0000";
+	char qmt[LUSTRE_MAXFSNAME + sizeof(postfix)];
+	int fsname_len, rc;
+
+	fsname_len = strnlen(fsname, LUSTRE_MAXFSNAME);
+	if (fsname_len > LUSTRE_MAXFSNAME || !fsname_len)
+		return -EINVAL;
+
+	memcpy(qmt, fsname, fsname_len);
+	memcpy(qmt + fsname_len, postfix, sizeof(postfix));
+	do_disconnect(NULL, 1);
+	rc = do_device("qmtioc", qmt);
 	if (rc) {
 		errno = ENODEV;
 		return -errno;
@@ -3279,7 +3254,7 @@ static void signal_server(int sig)
 
 int obd_initialize(int argc, char **argv)
 {
-	register_ioc_dev(OBD_DEV_ID, OBD_DEV_PATH);
+	llapi_register_ioc_dev(OBD_DEV_ID, OBD_DEV_PATH);
 
 	return 0;
 }
@@ -5159,6 +5134,8 @@ int jt_nodemap_modify(int argc, char **argv)
 		cmd = LCFG_NODEMAP_RBAC;
 	} else if (strcmp("deny_mount", param) == 0) {
 		cmd = LCFG_NODEMAP_DENY_MOUNT;
+	} else if (strcmp("gssonly_identification", param) == 0) {
+		cmd = LCFG_NODEMAP_GSS_IDENTIFY;
 	} else {
 		fprintf(stderr,
 			"error: %s: nodemap_modify invalid property: %s\n",
@@ -6389,6 +6366,213 @@ out:
 }
 
 #ifdef HAVE_SERVER_SUPPORT
+static void
+lqa_list_print(const char *fsname, const char *lqa, const char *buf, int len)
+{
+	__u32 *p;
+	int i = 0;
+
+	if (!lqa) {
+		printf("name:%s", len ? "" : " []");
+		for (; i < len / LQA_NAME_MAX; i++)
+			printf("%s%.*s", i ? ", " : " ", LQA_NAME_MAX,
+			       buf + i * LQA_NAME_MAX);
+	} else {
+		printf("name: %s\nranges:%s", lqa, len ? "" : " []");
+		for (p = (__u32 *)buf; i < len / LQA_RANGE_SIZE; i++, p += 2)
+			printf("%s%u-%u", i ? ", " : " ", p[0], p[1]);
+	}
+	printf("\n");
+}
+
+int lqa_ioctl(enum lqa_cmd_type cmd, char *cmdname, char *fsname, char *lqaname,
+	      __u32 start, __u32 end)
+{
+	struct obd_ioctl_data data;
+	int rc, lqalen;
+	char rawbuf[MAX_IOC_BUFLEN], *buf = rawbuf;
+	char lqa_buf[65536];
+
+	if (!fsname)
+		return -EFAULT;
+
+	memset(&data, 0, sizeof(data));
+	rc = data.ioc_dev = get_qmt_device(fsname);
+	if (rc < 0) {
+		fprintf(stderr, "error: %s: can not get qmt device\n",
+			jt_cmdname(cmdname));
+		return rc;
+	}
+	memset(buf, 0, sizeof(rawbuf));
+
+	data.ioc_command = cmd;
+	if (lqaname) {
+		lqalen = strnlen(lqaname, LQA_NAME_MAX + 1);
+		if (lqalen > LQA_NAME_MAX) {
+			fprintf(stderr, "error: lqaname `%.*s` exceeds maximum length %u\n",
+				LQA_NAME_MAX, lqaname, LQA_NAME_MAX);
+			return -ENAMETOOLONG;
+		}
+		if (lqalen) {
+			data.ioc_inlbuf1 = lqaname;
+			data.ioc_inllen1 = lqalen + 1;
+
+			if (cmd == LQA_ADD || cmd == LQA_REM) {
+				data.ioc_u32_1 = start;
+				data.ioc_u32_2 = end;
+			}
+		}
+	}
+
+	if (cmd == LQA_LIST) {
+		data.ioc_pbuf2 = lqa_buf;
+		data.ioc_plen2 = sizeof(lqa_buf);
+	}
+
+	memset(buf, 0, sizeof(rawbuf));
+	rc = llapi_ioctl_pack(&data, &buf, sizeof(rawbuf));
+	if (rc) {
+		fprintf(stderr, "error: %s: invalid ioctl: %s\n",
+			jt_cmdname(cmdname), strerror(-rc));
+		return rc;
+	}
+
+	rc = l_ioctl(OBD_DEV_ID, OBD_IOC_LQACTL, buf);
+	if (rc) {
+		fprintf(stderr, "error: %s: ioctl: %s\n",
+			jt_cmdname(cmdname), strerror(errno));
+		return -errno;
+	}
+
+	if (cmd == LQA_LIST) {
+		llapi_ioctl_unpack(&data, buf, sizeof(rawbuf));
+		lqa_list_print(fsname, lqaname, data.ioc_pbuf2, data.ioc_plen2);
+	}
+
+	return 0;
+}
+
+static inline int lqa_get_range(const char *range, __u32 *start, __u32 *end)
+{
+	long tmp_start, tmp_end;
+	int rc;
+
+	if (range == NULL)
+		return -EINVAL;
+
+	rc = sscanf(range, "%ld-%ld", &tmp_start, &tmp_end);
+	switch (rc) {
+	case 1:
+		tmp_end = tmp_start;
+		break;
+	case 2:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (tmp_end < tmp_start || tmp_start < 0 || tmp_end < 0)
+		return -EINVAL;
+
+	if (tmp_end > UINT_MAX || tmp_start > UINT_MAX)
+		return -ERANGE;
+
+	*start = (__u32)tmp_start;
+	*end = (__u32)tmp_end;
+
+	return 0;
+}
+
+static inline int lqa_cmd(int argc, char **argv, enum lqa_cmd_type cmd)
+{
+	char *lqaname = NULL;
+	char *fsname = NULL;
+	__u32 start = 0, end = 0;
+	struct option long_opts[] = {
+		{ .val = 'h', .name = "help", .has_arg = no_argument },
+		{ .val = 'f', .name = "fsname", .has_arg = required_argument },
+		{ .val = 'n', .name = "name", .has_arg = required_argument },
+		{ .val = 'r', .name = "range", .has_arg = required_argument },
+		{ .name = NULL },
+	};
+	bool range_defined = false;
+	int rc, c;
+
+	while ((c = getopt_long(argc, argv, "hf:l:r:",
+				long_opts, NULL)) != -1) {
+		switch (c) {
+		case 'f':
+			fsname = optarg;
+			if (strnlen(fsname, LUSTRE_MAXFSNAME + 1) >
+			    LUSTRE_MAXFSNAME) {
+				fprintf(stderr, "fsname is too long\n");
+				return -ENAMETOOLONG;
+			}
+			break;
+		case 'n':
+			lqaname = optarg;
+			if (strnlen(lqaname, LQA_NAME_MAX + 1) > LQA_NAME_MAX) {
+				fprintf(stderr, "lqaname is too long\n");
+				return -ENAMETOOLONG;
+			}
+			break;
+		case 'r':
+			if (!(cmd == LQA_ADD || cmd == LQA_REM))
+				return CMD_HELP;
+			if (lqa_get_range(optarg, &start, &end)) {
+				fprintf(stderr, "range is insane\n");
+				return -EINVAL;
+			}
+			range_defined = true;
+			break;
+		case 'h':
+			fallthrough;
+		default:
+			return CMD_HELP;
+		}
+	}
+
+	if (!fsname)
+		return CMD_HELP;
+
+	if (!lqaname && cmd != LQA_LIST)
+		return CMD_HELP;
+
+	if (!range_defined && (cmd == LQA_ADD || cmd == LQA_REM))
+		return CMD_HELP;
+
+	rc = lqa_ioctl(cmd, argv[0], fsname, lqaname, start, end);
+	if (rc < 0)
+		fprintf(stderr, "%s: %s\n", argv[0], strerror(-rc));
+
+	return rc;
+}
+
+int lctl_lqa_new(int argc, char **argv)
+{
+	return lqa_cmd(argc, argv, LQA_NEW);
+}
+
+int lctl_lqa_add(int argc, char **argv)
+{
+	return lqa_cmd(argc, argv, LQA_ADD);
+}
+
+int lctl_lqa_rem(int argc, char **argv)
+{
+	return lqa_cmd(argc, argv, LQA_REM);
+}
+
+int lctl_lqa_del(int argc, char **argv)
+{
+	return lqa_cmd(argc, argv, LQA_DEL);
+}
+
+int lctl_lqa_list(int argc, char **argv)
+{
+	return lqa_cmd(argc, argv, LQA_LIST);
+}
+
 static const char *barrier_status2name(enum barrier_status status)
 {
 	switch (status) {

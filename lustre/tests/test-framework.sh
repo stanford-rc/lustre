@@ -1025,14 +1025,21 @@ do_lctl() {
 	$LCTL "$@"
 }
 
+KMEMLEAK=${KMEMLEAK:-/sys/kernel/debug/kmemleak}
 load_lnet() {
 	# For kmemleak-enabled kernels we need clear all past state
 	# that obviously has nothing to do with this Lustre run
 	# Disable automatic memory scanning to avoid perf hit.
-	if [ -f /sys/kernel/debug/kmemleak ] ; then
-		echo scan=off > /sys/kernel/debug/kmemleak || true
-		echo scan > /sys/kernel/debug/kmemleak || true
-		echo clear > /sys/kernel/debug/kmemleak || true
+	if [[ -w $KMEMLEAK ]] ; then
+		local kmemleak_out=$(echo scan=off > $KMEMLEAK 2>&1 || true)
+
+		if [[ "$kmemleak_out" =~ "Device or resource busy" ]]; then
+			echo "kmemleak disabled"
+			export KMEMLEAK=disabled
+		else
+			echo scan > $KMEMLEAK || true
+			echo clear > $KMEMLEAK || true
+		fi
 	fi
 
 	echo Loading modules from $LUSTRE
@@ -1175,6 +1182,7 @@ load_modules_local() {
 		fi
 		load_module mgs/mgs
 		load_module mdd/mdd
+		MODOPTS_MDT=${MODOPTS_MDT:-"mdt_enable_flr_ec=1"}
 		load_module mdt/mdt
 		# don't fail if ost module doesn't exist
 		load_module ost/ost 2>/dev/null || true;
@@ -1183,6 +1191,7 @@ load_modules_local() {
 		load_module osp/osp
 	fi
 
+	MODOPTS_LLITE=${MODOPTS_LLITE:-"llite_enable_flr_ec=1"}
 	load_module llite/lustre
 	[ -d /r ] && OGDB=${OGDB:-"/r/tmp"}
 	OGDB=${OGDB:-$TMP}
@@ -1653,6 +1662,57 @@ init_gss() {
 	fi
 
 	do_nodesv $servers "$LCTL set_param sptlrpc.gss.rsi_upcall=$L_GETAUTH"
+}
+
+generate_load_ssk() {
+	local nodes_list=$(all_nodes)
+	local nm=$1
+
+	$GSS_SK || return 0
+
+	# Generate key
+	$LGSS_SK -t server -f$FSNAME -n $nm -w $SK_PATH/nodemap/$nm.key \
+	       -d /dev/urandom >/dev/null 2>&1
+
+	# Distribute key
+	if ! local_mode; then
+		for lnode in ${nodes_list//,/ }; do
+			scp $SK_PATH/nodemap/$nm.key \
+				${lnode}:${SK_PATH}/nodemap/
+		done
+	fi
+
+	# Set client key to client type to generate prime P
+	if local_mode; then
+		do_nodes $(comma_list $(all_nodes)) "$LGSS_SK -t client,server \
+			-m $SK_PATH/nodemap/$nm.key >/dev/null 2>&1"
+	else
+	        $LGSS_SK -t client -m $SK_PATH/nodemap/$nm.key >/dev/null 2>&1
+	fi
+
+	# Load key
+	do_nodes $(comma_list $(all_server_nodes)) \
+		"$LGSS_SK -t server -l $SK_PATH/nodemap/$nm.key"
+	$LGSS_SK -l $SK_PATH/nodemap/$nm.key
+	do_nodes $(comma_list $(all_nodes)) \
+		"keyctl show | grep lustre | cut -c1-11 |
+		sed -e 's/ //g;' |
+		xargs -IX keyctl setperm X 0x3f3f3f3f"
+}
+
+cleanup_unload_ssk() {
+	local nm=$1
+
+	$GSS_SK || return 0
+
+	do_nodes $(comma_list $(all_server_nodes)) \
+		"keyctl show | grep lustre:$FSNAME:$nm | cut -c1-11 |
+		sed -e 's/ //g;' |
+		xargs -IX keyctl revoke X"
+	keyctl show | grep lustre:$FSNAME | cut -c1-11 | sed -e 's/ //g;' |
+		xargs -IX keyctl revoke X
+	do_nodes $(comma_list $(all_nodes)) "keyctl reap"
+	do_nodes $(comma_list $(all_nodes)) "rm -f $SK_PATH/nodemap/$nm.key"
 }
 
 cleanup_gss() {
@@ -3141,7 +3201,9 @@ fi"
 
 shutdown_node () {
 	local node=$1
+	local uptime_info=$(do_node $node "uptime" 2>/dev/null || echo "uptime unavailable")
 
+	log "shutdown_node: $node uptime: $uptime_info"
 	echo + $POWER_DOWN $node
 	$POWER_DOWN $node
 }
@@ -3151,9 +3213,10 @@ shutdown_node_hard () {
 	local attempts=$SHUTDOWN_ATTEMPTS
 
 	for i in $(seq $attempts) ; do
-		shutdown_node $host
 		sleep 1
-		wait_for_function --quiet "! ping -w 3 -c 1 $host" 5 1 &&
+		shutdown_node $host
+		sleep 5
+		wait_for_function "! ping -w 3 -c 1 $host" 5 1 &&
 			return 0
 		echo "waiting for $host to fail attempts=$attempts"
 		[ $i -lt $attempts ] ||
@@ -3165,7 +3228,9 @@ shutdown_client() {
 	local client=$1
 	local mnt=${2:-$MOUNT}
 	local attempts=3
+	local uptime_info=$(do_node $client "uptime" 2>/dev/null || echo "uptime unavailable")
 
+	log "shutdown_client: $client uptime: $uptime_info"
 	if [ "$FAILURE_MODE" = HARD ]; then
 		shutdown_node_hard $client
 	else
@@ -3233,7 +3298,9 @@ shutdown_facet() {
 
 reboot_node() {
 	local node=$1
+	local uptime_info=$(do_node $node "uptime" 2>/dev/null || echo "uptime unavailable")
 
+	log "reboot_node: $node uptime before reboot: $uptime_info"
 	echo + $POWER_UP $node
 	$POWER_UP $node
 }
@@ -3647,6 +3714,8 @@ wait_update_facet() {
 }
 
 sync_all_data_mdts() {
+# force flush delayed destroy
+	do_nodes $(mdts_nodes) "lctl set_param -n mdt.*.force_sync=1"
 	do_nodes $(mdts_nodes) "lctl set_param -n os[cd]*.*MDT*.force_sync=1"
 }
 
@@ -4888,7 +4957,7 @@ get_env_vars() {
 		echo -n " FSTYPE=$FSTYPE"
 	fi
 
-	for var in LNETLND NETTYPE; do
+	for var in LNETLND NETTYPE FORCE_LARGE_NID; do
 		if [ -n "${!var}" ]; then
 			echo -n " $var=${!var}"
 		fi
@@ -9230,7 +9299,7 @@ add_pool_to_list () {
 	local fsname=${1%%.*}
 	local poolname=${1##$fsname.}
 
-	local listvar=${fsname}_CREATED_POOLS
+	local listvar=CREATED_POOLS_${fsname}
 	local temp=${listvar}=$(expand_list ${!listvar} $poolname)
 	eval export $temp
 }
@@ -9239,7 +9308,7 @@ remove_pool_from_list () {
 	local fsname=${1%%.*}
 	local poolname=${1##$fsname.}
 
-	local listvar=${fsname}_CREATED_POOLS
+	local listvar=CREATED_POOLS_${fsname}
 	local temp=${listvar}=$(exclude_items_from_list "${!listvar}" $poolname)
 	eval export $temp
 }
@@ -9298,7 +9367,7 @@ destroy_pools () {
 	local fsname=${1:-$FSNAME}
 	local mdscount=${2:-$MDSCOUNT}
 	local poolname
-	local listvar=${fsname}_CREATED_POOLS
+	local listvar=CREATED_POOLS_${fsname}
 
 	[ x${!listvar} = x ] && return 0
 
@@ -12610,17 +12679,28 @@ zfs_or_rotational() {
 
 ost_fid2_objpath() {
 	local facet=$1
-	local fid=$2
+	local fid=${2/[\[\]]/}
+	local seq
+	local oidhex
+	local ver
+	local oid
 
-	fid=$(echo $fid | tr -d '[]')
+	IFS=: read seq oidhex ver <<< $fid
+	seq=${seq#0x}
+	oid=${oidhex#0x}
 
-	seq=$(echo $fid | awk -F ':' '{ print $1 }' | sed -e "s/^0x//g")
-	oidhex=$(echo $fid | awk -F ':' '{ print $2 }')
+	(( seq == 1 )) && {
+		if [[ $(facet_fstype $facet) == ldiskfs ]]; then
+			oid=$((16#$oid))
+			echo "O/1/d$((oid%32))/$((oid))"
+		elif [[ $(facet_fstype $facet) == zfs ]]; then
+                        echo "oi.1/$fid"
+		fi
+		return
+	}
 
 	if [ $seq == 0 ] || [ $(facet_fstype $facet) == zfs ]; then
-		oid=$((16#${oidhex#0x}))
-	else
-		oid=${oidhex#0x}
+		oid=$((16#$oid))
 	fi
 
 	echo "O/$seq/d$((oidhex%32))/$oid"
@@ -12694,16 +12774,17 @@ check_seq_oid()
 		# fid: parent=[0x200000400:0x1e:0x0] stripe=1 stripe_count=2 \
 		#	stripe_size=1048576 component_id=1 component_start=0 \
 		#	component_end=33554432
-		local ff_parent=$(sed -e 's/.*parent=.//' <<<$ff)
+		local ff_parent=$(grep -oP 'parent=\K\S+' <<<$ff | tr -d '[]')
 		local ff_pseq=$(cut -d: -f1 <<<$ff_parent)
 		local ff_poid=$(cut -d: -f2 <<<$ff_parent)
-		local ff_pstripe
+
+		# $LL_DECODE_FILTER_FID does not print "stripe="; look
+		# into f_ver by default. See comment on ff_parent.
+		local ff_pstripe=$(cut -d: -f3 <<<$ff_parent)
+
+		# If there is a stripe information use it.
 		if grep -q 'stripe=' <<<$ff; then
 			ff_pstripe=$(sed -e 's/.*stripe=//' -e 's/ .*//' <<<$ff)
-		else
-			# $LL_DECODE_FILTER_FID does not print "stripe="; look
-			# into f_ver in this case.  See comment on ff_parent.
-			ff_pstripe=$(cut -d: -f3 <<<$ff_parent | sed -e 's/]//')
 		fi
 
 		# compare lmm_seq and filter_fid->ff_parent.f_seq

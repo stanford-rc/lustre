@@ -10,7 +10,10 @@
  */
 
 #include <linux/kprobes.h>
+#include <linux/memcontrol.h>
+#include <lustre_compat/linux/mm.h>
 #include <lustre_compat/linux/security.h>
+#include <lustre_compat/linux/vmalloc.h>
 #include <lustre_compat/linux/workqueue.h>
 
 #include <linux/libcfs/libcfs.h>
@@ -60,6 +63,14 @@ struct workqueue_attrs *compat_alloc_workqueue_attrs(void)
 }
 EXPORT_SYMBOL(compat_alloc_workqueue_attrs);
 
+static void (*__free_workqueue_attrs)(struct workqueue_attrs *attrs);
+
+void compat_free_workqueue_attrs(struct workqueue_attrs *attrs)
+{
+	return __free_workqueue_attrs(attrs);
+}
+EXPORT_SYMBOL(compat_free_workqueue_attrs);
+
 static int (*__apply_workqueue_attrs)(struct workqueue_struct *wq,
 				      const struct workqueue_attrs *attrs);
 
@@ -74,6 +85,25 @@ EXPORT_SYMBOL(compat_apply_workqueue_attrs);
 # define ALLOC_WQ_ATTRS_FUNC	"alloc_workqueue_attrs_noprof"
 #else
 # define ALLOC_WQ_ATTRS_FUNC	"alloc_workqueue_attrs"
+#endif
+
+#if defined(CONFIG_MEMCG) && !defined(HAVE_FOLIO_MEMCG_LOCK_STATIC) \
+ && defined(HAVE_FOLIO_MEMCG_LOCK) && !defined(FOLIO_MEMCG_LOCK_EXPORTED)
+static void (*__folio_memcg_lock)(struct folio *folio);
+
+void folio_memcg_lock(struct folio *folio)
+{
+	__folio_memcg_lock(folio);
+}
+EXPORT_SYMBOL_GPL(folio_memcg_lock);
+
+static void (*__folio_memcg_unlock)(struct folio *folio);
+
+void folio_memcg_unlock(struct folio *folio)
+{
+	__folio_memcg_unlock(folio);
+}
+EXPORT_SYMBOL_GPL(folio_memcg_unlock);
 #endif
 
 #ifdef CONFIG_SECURITY
@@ -93,6 +123,18 @@ void compat_security_file_free(struct file *file)
 EXPORT_SYMBOL(compat_security_file_free);
 #endif
 
+#if !defined(HAVE_ACCOUNT_PAGE_DIRTIED_EXPORT) && defined(HAVE_ACCOUNT_PAGE_DIRTIED)
+static unsigned int (*__account_page_dirtied)(struct page *page,
+					       struct address_space *mapping);
+
+unsigned int compat_account_page_dirtied(struct page *page,
+					 struct address_space *mapping)
+{
+	return __account_page_dirtied(page, mapping);
+}
+EXPORT_SYMBOL(compat_account_page_dirtied);
+#endif
+
 int lustre_symbols_init(void)
 {
 	int rc;
@@ -108,10 +150,29 @@ int lustre_symbols_init(void)
 	if (!__alloc_workqueue_attrs)
 		return -EINVAL;
 
+	__free_workqueue_attrs = cfs_kallsyms_lookup_name("free_workqueue_attrs");
+	if (!__free_workqueue_attrs)
+		return -EINVAL;
+
 	__apply_workqueue_attrs = cfs_kallsyms_lookup_name("apply_workqueue_attrs");
 	if (!__apply_workqueue_attrs)
 		return -EINVAL;
 
+#if defined(CONFIG_MEMCG) && !defined(HAVE_FOLIO_MEMCG_LOCK_STATIC) \
+ && defined(HAVE_FOLIO_MEMCG_LOCK) && !defined(FOLIO_MEMCG_LOCK_EXPORTED)
+	__folio_memcg_lock = cfs_kallsyms_lookup_name("folio_memcg_lock");
+	if (!__folio_memcg_lock)
+		return -EINVAL;
+
+	__folio_memcg_unlock = cfs_kallsyms_lookup_name("folio_memcg_unlock");
+	if (!__folio_memcg_unlock)
+		return -EINVAL;
+#endif
+#if !defined(HAVE_ACCOUNT_PAGE_DIRTIED_EXPORT) && defined(HAVE_ACCOUNT_PAGE_DIRTIED)
+	__account_page_dirtied = cfs_kallsyms_lookup_name("account_page_dirtied");
+	if (!__account_page_dirtied)
+		return -EINVAL;
+#endif
 #ifdef CONFIG_SECURITY
 	__security_file_alloc = cfs_kallsyms_lookup_name("security_file_alloc");
 	if (!__security_file_alloc)

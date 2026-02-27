@@ -151,7 +151,8 @@ int nm_member_add(struct lu_nodemap *nodemap, struct obd_export *exp)
 		      "nodemap %s already member of %s\n", exp,
 		      exp->exp_client_uuid.uuid,
 		      nodemap->nm_name,
-		      (exp->exp_target_data.ted_nodemap == NULL) ? "unknown" :
+		      (exp->exp_target_data.ted_nodemap == NULL) ?
+				NRS_TBF_TYPE_UNKNOWN :
 				exp->exp_target_data.ted_nodemap->nm_name);
 		RETURN(-EEXIST);
 	}
@@ -355,7 +356,9 @@ void nm_member_reclassify_nodemap(struct lu_nodemap *nodemap)
 	list_for_each_entry_safe(exp, tmp, &nodemap->nm_member_list,
 				 exp_target_data.ted_nodemap_member) {
 		struct lnet_nid *nid;
-		bool banned, newly_banned;
+		bool banned = false, newly_banned;
+
+		new_nodemap = NULL;
 
 		/* if no conn assigned to this exp, reconnect will reclassify */
 		spin_lock(&exp->exp_lock);
@@ -371,12 +374,42 @@ void nm_member_reclassify_nodemap(struct lu_nodemap *nodemap)
 		    !rhashtable_init(&nm_cmp_cache, &nm_cmp_cache_params))
 			use_nm_cmp_cache = true;
 
-		/* nodemap_classify_nid requires nmc_range_tree_lock and
-		 * nmc_ban_range_tree_lock
+		/* If gssonly_identification is enforced for this nodemap, we
+		 * need to stick with it, and do not rely on NID ranges, unless
+		 * it has lost its gss_id flag in the new nodemap config.
 		 */
-		down_read(&active_config->nmc_ban_range_tree_lock);
-		new_nodemap = nodemap_classify_nid(nid, &banned);
-		up_read(&active_config->nmc_ban_range_tree_lock);
+		if (nodemap->nmf_gss_identify) {
+			new_nodemap = nodemap_lookup(nodemap->nm_name);
+			if (!IS_ERR(new_nodemap)) {
+				struct lu_nid_range *range;
+
+				if (!new_nodemap->nmf_gss_identify) {
+					nodemap_putref(new_nodemap);
+					new_nodemap = NULL;
+					GOTO(classify, 0);
+				}
+				down_read(
+				       &active_config->nmc_ban_range_tree_lock);
+				range = ban_range_search(active_config,
+							 nid);
+				up_read(
+				       &active_config->nmc_ban_range_tree_lock);
+				if (range &&
+				    range->rn_nodemap == new_nodemap)
+					banned = true;
+			}
+		}
+
+		if (IS_ERR_OR_NULL(new_nodemap)) {
+			/* nodemap_classify_nid requires nmc_range_tree_lock and
+			 * nmc_ban_range_tree_lock
+			 */
+classify:
+			down_read(&active_config->nmc_ban_range_tree_lock);
+			new_nodemap = nodemap_classify_nid(nid, &banned);
+			up_read(&active_config->nmc_ban_range_tree_lock);
+		}
+
 		if (IS_ERR(new_nodemap))
 			continue;
 

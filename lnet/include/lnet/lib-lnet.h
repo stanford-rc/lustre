@@ -19,9 +19,9 @@
 #define CFS_FAIL_MATCH_MD_NID		0xe001
 #define CFS_FAIL_DELAY_MSG_FORWARD	0xe002
 #define CFS_FAIL_TEST_PING_MD		0xe003
+#define CFS_FAIL_RTR_HEALTH_INC		0xe004
 
-#include <lustre_compat/linux/generic-radix-tree.h>
-#include <lustre_compat/linux/hash.h>
+#include <linux/hash.h>
 #include <linux/netdevice.h>
 #include <linux/libcfs/libcfs_debug.h>
 #include <linux/libcfs/libcfs_private.h>
@@ -513,8 +513,8 @@ lnet_nid2peerhash(struct lnet_nid *nid)
 	int i;
 
 	for (i = 0; i < 4; i++)
-		h = cfs_hash_32(nid->nid_addr[i]^h, 32);
-	return cfs_hash_32(LNET_NID_NET(nid) ^ h, LNET_PEER_HASH_BITS);
+		h = hash_32(nid->nid_addr[i]^h, 32);
+	return hash_32(LNET_NID_NET(nid) ^ h, LNET_PEER_HASH_BITS);
 }
 
 static inline struct list_head *
@@ -652,8 +652,6 @@ extern void lnet_peer_ni_add_to_recoveryq_locked(struct lnet_peer_ni *lpni,
 extern int lnet_peer_add_pref_nid(struct lnet_peer_ni *lpni,
 				  struct lnet_nid *nid);
 extern void lnet_peer_clr_pref_nids(struct lnet_peer_ni *lpni);
-extern int lnet_peer_del_pref_nid(struct lnet_peer_ni *lpni,
-				  struct lnet_nid *nid);
 void lnet_peer_ni_set_selection_priority(struct lnet_peer_ni *lpni,
 					 __u32 priority);
 extern void lnet_ni_add_to_recoveryq_locked(struct lnet_ni *ni,
@@ -1002,6 +1000,7 @@ int lnet_ping_info_validate(struct lnet_ping_info *pinfo);
 struct lnet_ping_buffer *lnet_ping_buffer_alloc(int bytes, gfp_t gfp);
 void lnet_ping_buffer_free(struct kref *kref);
 int lnet_get_link_status(struct net_device *dev);
+int lnet_get_link_status_locked(struct net_device *dev);
 __u32 lnet_set_link_fatal_state(struct lnet_ni *ni, unsigned int link_state);
 
 struct lnet_ping_iter {

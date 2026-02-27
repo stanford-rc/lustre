@@ -110,9 +110,11 @@ static struct lu_object *osp_object_alloc(const struct lu_env *env,
 			lu_object_header_init(h);
 			dt_object_init(&o->opo_obj, h, d);
 			lu_object_add_top(h, l);
+			set_bit(LU_OBJECT_DFREE, &h->loh_flags);
 		} else {
 			dt_object_init(&o->opo_obj, NULL, d);
 		}
+
 
 		l->lo_ops = &osp_lu_obj_ops;
 
@@ -1088,6 +1090,7 @@ static int osp_init0(const struct lu_env *env, struct osp_device *osp,
 		RETURN(-ENODEV);
 	}
 	osp->opd_obd = obd;
+	osp->opd_dt_dev.dd_lu_dev.ld_obd = obd;
 
 	src = lustre_cfg_string(cfg, 0);
 	if (src == NULL)

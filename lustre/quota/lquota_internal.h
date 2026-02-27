@@ -177,9 +177,6 @@ struct lquota_entry {
 	struct mutex		 lqe_glbl_data_lock;
 	struct lqe_glbl_data	*lqe_glbl_data;
 	struct work_struct	 lqe_work; /* workitem to free lvbo */
-
-	/* the time when the blocks belonging to this QID should be truncated */
-	time64_t		 lqe_truncated_time;
 };
 
 #define lqe_qtype(lqe)		(lqe->lqe_site->lqs_qtype)
@@ -315,7 +312,7 @@ static inline void lqe_read_unlock(struct lquota_entry *lqe)
 
 /* minimum qunit size, 1K inode for metadata pool and 1MB for data pool */
 #define LQUOTA_LEAST_QUNIT(type) \
-	(type == LQUOTA_RES_MD ? (1 << 10) : toqb(OFD_MAX_BRW_SIZE))
+	(type == LQUOTA_RES_MD ? (1 << 10) : stoqb(OFD_MAX_BRW_SIZE))
 
 static inline enum osd_quota_local_flags lquota_over_fl(int qtype)
 {
@@ -453,7 +450,7 @@ void lquota_site_free(const struct lu_env *, struct lquota_site *);
 #define lqe_find(env, site, id) lqe_locate_find(env, site, id, true)
 struct lquota_entry *lqe_locate_find(const struct lu_env *,
 				     struct lquota_site *,
-				     union lquota_id *, bool);
+				     const union lquota_id *, bool);
 
 static inline void lqe_set_deleted(struct lquota_entry *lqe)
 {

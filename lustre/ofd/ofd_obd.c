@@ -271,8 +271,10 @@ static int ofd_obd_reconnect(const struct lu_env *env, struct obd_export *exp,
 			     struct obd_connect_data *data,
 			     void *localdata)
 {
+	struct ptlrpc_request *req = localdata;
+	struct ptlrpc_svc_ctx *svc_ctx = NULL;
+	struct lnet_nid *client_nid = NULL;
 	struct ofd_device *ofd;
-	struct lnet_nid *client_nid = localdata;
 	int rc;
 
 	ENTRY;
@@ -280,17 +282,30 @@ static int ofd_obd_reconnect(const struct lu_env *env, struct obd_export *exp,
 	if (!exp || !obd || !cluuid)
 		RETURN(-EINVAL);
 
-	rc = nodemap_add_member(client_nid, exp);
-	if (rc != 0 && rc != -EEXIST)
-		RETURN(rc);
+	if (req) {
+		svc_ctx = req->rq_svc_ctx;
+		client_nid = &req->rq_peer.nid;
+	}
+
+	if (svc_ctx || client_nid) {
+		rc = nodemap_add_member(svc_ctx, client_nid, exp);
+		if (rc != 0 && rc != -EEXIST)
+			RETURN(rc);
+	} else {
+		CDEBUG(D_HA,
+		       "%s: cannot find nodemap for client %s: svc_ctx and nid are null\n",
+		       obd->obd_name, cluuid->uuid);
+	}
 
 	ofd = ofd_dev(obd->obd_lu_dev);
 
 	rc = ofd_parse_connect_data(env, exp, data, false);
-	if (rc == 0)
-		ofd_export_stats_init(ofd, exp, client_nid);
-	else
+	if (rc == 0) {
+		if (client_nid)
+			ofd_export_stats_init(ofd, exp, client_nid);
+	} else {
 		nodemap_del_member(exp);
+	}
 
 	RETURN(rc);
 }
@@ -316,10 +331,12 @@ static int ofd_obd_connect(const struct lu_env *env, struct obd_export **_exp,
 			   struct obd_device *obd, struct obd_uuid *cluuid,
 			   struct obd_connect_data *data, void *localdata)
 {
+	struct ptlrpc_request *req = localdata;
+	struct ptlrpc_svc_ctx *svc_ctx = NULL;
+	struct lnet_nid *client_nid = NULL;
+	struct lustre_handle conn = { 0 };
 	struct obd_export *exp;
 	struct ofd_device *ofd;
-	struct lustre_handle conn = { 0 };
-	struct lnet_nid *client_nid = localdata;
 	int rc;
 
 	ENTRY;
@@ -336,13 +353,18 @@ static int ofd_obd_connect(const struct lu_env *env, struct obd_export **_exp,
 	exp = class_conn2export(&conn);
 	LASSERT(exp != NULL);
 
-	if (client_nid) {
-		rc = nodemap_add_member(client_nid, exp);
+	if (req) {
+		svc_ctx = req->rq_svc_ctx;
+		client_nid = &req->rq_peer.nid;
+	}
+
+	if (svc_ctx || client_nid) {
+		rc = nodemap_add_member(svc_ctx, client_nid, exp);
 		if (rc != 0 && rc != -EEXIST)
 			GOTO(out, rc);
 	} else {
 		CDEBUG(D_HA,
-		       "%s: cannot find nodemap for client %s: nid is null\n",
+		       "%s: cannot find nodemap for client %s: svc_ctx and nid are null\n",
 		       obd->obd_name, cluuid->uuid);
 	}
 
@@ -358,7 +380,8 @@ static int ofd_obd_connect(const struct lu_env *env, struct obd_export **_exp,
 		rc = tgt_client_new(env, exp);
 		if (rc != 0)
 			GOTO(out, rc);
-		ofd_export_stats_init(ofd, exp, client_nid);
+		if (client_nid)
+			ofd_export_stats_init(ofd, exp, client_nid);
 	}
 
 	CDEBUG(D_HA, "%s: get connection from MDS %d\n", obd->obd_name,
@@ -1207,6 +1230,15 @@ out:
 	return rc;
 }
 
+/* this should sync the whole device */
+static int ofd_device_sync(const struct lu_env *env, struct ofd_device *ofd)
+{
+	lu_objects_destroy_delayed();
+
+	RETURN(dt_sync(env, ofd->ofd_osd));
+}
+
+
 /**
  * Implementation of obd_ops::o_iocontrol.
  *
@@ -1248,10 +1280,10 @@ static int ofd_iocontrol(unsigned int cmd, struct obd_export *exp, int len,
 		GOTO(out, rc);
 	case OBD_IOC_SYNC:
 		CDEBUG(D_RPCTRACE, "syncing ost %s\n", obd->obd_name);
-		rc = dt_sync(&env, ofd->ofd_osd);
+		rc = ofd_device_sync(&env, ofd);
 		GOTO(out, rc);
 	case OBD_IOC_SET_READONLY:
-		rc = dt_sync(&env, ofd->ofd_osd);
+		rc = ofd_device_sync(&env, ofd);
 		if (rc == 0)
 			rc = dt_ro(&env, ofd->ofd_osd);
 		GOTO(out, rc);

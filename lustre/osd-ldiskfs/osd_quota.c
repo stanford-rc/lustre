@@ -117,11 +117,7 @@ static int osd_acct_index_lookup(const struct lu_env *env,
 				 const struct dt_key *dtkey)
 {
 	struct osd_thread_info *info = osd_oti_get(env);
-#if defined(HAVE_DQUOT_QC_DQBLK)
 	struct qc_dqblk *dqblk = &info->oti_qdq;
-#else
-	struct fs_disk_quota *dqblk = &info->oti_fdq;
-#endif
 	struct super_block *sb = osd_sb(osd_obj2dev(osd_dt_obj(dtobj)));
 	struct lquota_acct_rec *rec = (struct lquota_acct_rec *)dtrec;
 	__u64 id = *((__u64 *)dtkey);
@@ -137,13 +133,10 @@ static int osd_acct_index_lookup(const struct lu_env *env,
 	rc = sb->s_qcop->get_dqblk(sb, qid, dqblk);
 	if (rc)
 		RETURN(rc);
-#if defined(HAVE_DQUOT_QC_DQBLK)
+
 	rec->bspace = dqblk->d_space;
 	rec->ispace = dqblk->d_ino_count;
-#else
-	rec->bspace = dqblk->d_bcount;
-	rec->ispace = dqblk->d_icount;
-#endif
+
 	RETURN(+1);
 }
 
@@ -546,8 +539,8 @@ int osd_declare_qid(const struct lu_env *env, struct osd_thandle *oh,
 		inode = obj->oo_inode;
 		ino = inode ? inode->i_ino : 0;
 	}
-	CDEBUG(D_QUOTA, "fid="DFID" ino=%llu type=%u, id=%llu\n",
-	       PFID(&fid), ino, qi->lqi_type, qi->lqi_id.qid_uid);
+	CDEBUG(D_QUOTA, "fid="DFID" %p ino=%llu type=%u, id=%llu\n",
+	       PFID(&fid), inode, ino, qi->lqi_type, qi->lqi_id.qid_uid);
 
 	LASSERT(oh != NULL);
 	LASSERTF(oh->ot_id_cnt <= OSD_MAX_UGID_CNT, "count=%d\n",
@@ -696,15 +689,13 @@ int osd_declare_inode_qid(const struct lu_env *env, qid_t uid, qid_t gid,
 	if (local_flags)
 		tmp_flags = *local_flags;
 	rcp = osd_declare_qid(env, oh, qi, obj, true, &tmp_flags);
-	if (tmp_flags & QUOTA_FL_ROOT_PRJQUOTA) {
+	if (tmp_flags & QUOTA_FL_ROOT_PRJQUOTA &&
+	    !(osd_qid_declare_flags & OSD_QID_IGNORE_ROOT_PRJ))
 		/* Currently, th_ignore_quota is only set for inode quota
 		 * in mdd_trans_create if the user has CAP_SYS_RESOURCE,
-		 * then it should be diabled if root_prj_enable is set. */
-		if (qi->lqi_is_blk)
-			force = th->th_ignore_quota;
-		else
-			force = 0;
-	}
+		 * then it should be ignored if root_prj_enable is set.
+		 */
+		force = 0;
 	if (local_flags)
 		*local_flags = tmp_flags;
 

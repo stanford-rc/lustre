@@ -270,7 +270,7 @@ struct client_obd {
 	struct obd_histogram	cl_write_offset_hist;
 	struct obd_histogram	cl_read_io_latency_hist;
 	struct obd_histogram	cl_write_io_latency_hist;
-	/* RPC latency histograms by size (in pages) */
+	/* RPC latency histograms by size (in pages) stores "binary usec" */
 	ktime_t			cl_io_latency_stats_init;
 	struct obd_histogram	*cl_read_io_latency_by_size;
 	struct obd_histogram	*cl_write_io_latency_by_size;
@@ -664,7 +664,7 @@ struct obd_device {
 	/* nid-export hash body */
 	struct rhltable			obd_nid_hash;
 	/* nid stats body */
-	struct cfs_hash             *obd_nid_stats_hash;
+	struct rhltable			obd_nid_stats_hash;
 	/* client_generation-export hash body */
 	struct cfs_hash		    *obd_gen_hash;
 	struct list_head	obd_nid_stats;
@@ -817,6 +817,9 @@ int obd_nid_export_for_each(struct obd_device *obd, struct lnet_nid *nid,
 			    void *data);
 int obd_nid_add(struct obd_device *obd, struct obd_export *exp);
 void obd_nid_del(struct obd_device *obd, struct obd_export *exp);
+
+struct nid_stat *obd_nid_stats_get(struct obd_device *obd, struct nid_stat *ns);
+void obd_nid_stats_put(struct obd_device *obd, struct nid_stat *ns);
 
 /* both client and MDT recovery are aborted, or MDT is stopping  */
 static inline bool obd_recovery_abort(struct obd_device *obd)
@@ -1392,6 +1395,10 @@ struct md_ops {
 			     bool wait);
 	int (*m_batch_add)(struct obd_export *exp, struct lu_batch *bh,
 			   struct md_op_item *item);
+	int (*m_dirpage_add)(struct obd_export *exp, struct inode *inode,
+			     struct page **pool,
+			     unsigned int cfs_pgs, unsigned int lu_pgs,
+			     int is_hash64);
 };
 
 static inline struct md_open_data *obd_mod_alloc(void)
@@ -1509,8 +1516,8 @@ static inline void client_adjust_max_dirty(struct client_obd *cli)
 			cli->cl_dirty_max_pages = dirty_max;
 	}
 
-	if (cli->cl_dirty_max_pages > cfs_totalram_pages() / 8)
-		cli->cl_dirty_max_pages = cfs_totalram_pages() / 8;
+	if (cli->cl_dirty_max_pages > compat_totalram_pages() / 8)
+		cli->cl_dirty_max_pages = compat_totalram_pages() / 8;
 
 	/* This value is exported to userspace through the max_dirty_mb
 	 * parameter.  So we round up the number of pages to make it a round
@@ -1533,11 +1540,6 @@ static inline struct inode *page2inode(struct page *page)
 	} else {
 		return NULL;
 	}
-}
-
-static inline bool obd_is_osd_wbcfs(const struct obd_device *obd)
-{
-	return !strstr(obd->obd_name, LUSTRE_OSD_WBCFS_NAME);
 }
 
 #endif /* __OBD_H */

@@ -32,11 +32,7 @@
 #ifndef HAVE_USER_NAMESPACE_ARG
 #define ll_create_nd(ns, dir, de, mode, ex)	ll_create_nd(dir, de, mode, ex)
 #define ll_mknod(ns, dir, dch, mode, rd)	ll_mknod(dir, dch, mode, rd)
-#ifdef HAVE_IOPS_RENAME_WITH_FLAGS
 #define ll_rename(ns, src, sdc, tgt, tdc, fl)	ll_rename(src, sdc, tgt, tdc, fl)
-#else
-#define ll_rename(ns, src, sdc, tgt, tdc)	ll_rename(src, sdc, tgt, tdc)
-#endif /* HAVE_IOPS_RENAME_WITH_FLAGS */
 #define ll_symlink(nd, dir, dch, old)		ll_symlink(dir, dch, old)
 #endif
 
@@ -993,6 +989,61 @@ out:
 	RETURN(rc);
 }
 
+/* If it's open-by-FID, convert fname to FID, set both fid1 and fid2 to this
+ * FID, and clear name.  This can aovid round-trip to MDT0 if the FID is not
+ * located on MDT0.
+ */
+static void obf_mod_fixup(struct md_op_data *op_data, struct lookup_intent *it)
+{
+	struct lu_fid fid;
+	const char *name = op_data->op_name;
+
+	if (op_data->op_code != LUSTRE_OPC_ANY)
+		return;
+
+	if (fid_is_sane(&op_data->op_fid2))
+		return;
+
+	if (!op_data->op_namelen)
+		return;
+
+	if (name[0] == '[') {
+		if (op_data->op_namelen < 2)
+			return;
+		name++;
+	}
+
+	if (sscanf(name, SFID, RFID(&fid)) != 3)
+		return;
+
+	if (!fid_is_sane(&fid))
+		return;
+
+	if (!fid_is_norm(&fid) && !fid_is_igif(&fid) &&
+	    !fid_is_root(&fid) && !fid_seq_is_dot(fid.f_seq))
+		return;
+
+	op_data->op_fid2 = fid;
+	op_data->op_bias = MDS_FID_OP;
+	if (op_data->op_flags & MF_OPNAME_KMALLOCED) {
+		/* allocated via ll_setup_filename called
+		 * from ll_prep_md_op_data
+		 */
+		kfree(op_data->op_name);
+		op_data->op_flags &= ~MF_OPNAME_KMALLOCED;
+	}
+	op_data->op_name = NULL;
+	op_data->op_namelen = 0;
+
+	if (it->it_op & IT_OPEN)
+		it->it_open_flags |= MDS_OPEN_BY_FID;
+	else
+		/* getattr by FID in the old way, otherwise MDT will complain
+		 * name is missing.
+		 */
+		op_data->op_fid1 = fid;
+}
+
 static struct dentry *ll_lookup_it(struct inode *parent, struct dentry *dentry,
 				   struct lookup_intent *it,
 				   struct pcc_create_attach *pca,
@@ -1052,10 +1103,12 @@ static struct dentry *ll_lookup_it(struct inode *parent, struct dentry *dentry,
 	}
 	if (!fid_is_zero(&fid)) {
 		op_data->op_fid2 = fid;
-		op_data->op_bias = MDS_FID_OP;
+		op_data->op_bias = MDS_FID_OP | MDS_NAMEHASH;
 		if (it->it_op & IT_OPEN)
 			it->it_open_flags |= MDS_OPEN_BY_FID;
 	}
+	if (fid_is_obf(ll_inode2fid(parent)))
+		obf_mod_fixup(op_data, it);
 
 	if (!sbi->ll_dir_open_read && it->it_op & IT_OPEN &&
 	    it->it_open_flags & O_DIRECTORY)
@@ -2406,11 +2459,8 @@ out:
 
 static int ll_rename(struct mnt_idmap *map,
 		     struct inode *src, struct dentry *src_dchild,
-		     struct inode *tgt, struct dentry *tgt_dchild
-#if defined(HAVE_USER_NAMESPACE_ARG) || defined(HAVE_IOPS_RENAME_WITH_FLAGS)
-		     , unsigned int flags
-#endif
-		     )
+		     struct inode *tgt, struct dentry *tgt_dchild,
+		     unsigned int flags)
 {
 	struct ptlrpc_request *request = NULL;
 	struct ll_sb_info *sbi = ll_i2sbi(src);
@@ -2422,10 +2472,8 @@ static int ll_rename(struct mnt_idmap *map,
 
 	ENTRY;
 
-#if defined(HAVE_USER_NAMESPACE_ARG) || defined(HAVE_IOPS_RENAME_WITH_FLAGS)
 	if (flags)
 		GOTO(out, err = -EINVAL);
-#endif
 
 	CDEBUG(D_VFSTRACE,
 	       "VFS Op:oldname="DNAME", src_dir="DFID"(%p), newname=%pd, tgt_dir="DFID"(%p)\n",
@@ -2435,11 +2483,7 @@ static int ll_rename(struct mnt_idmap *map,
 	if (unlikely(d_mountpoint(src_dchild) || d_mountpoint(tgt_dchild)))
 		GOTO(out, err = -EBUSY);
 
-#if defined(HAVE_USER_NAMESPACE_ARG) || defined(HAVE_IOPS_RENAME_WITH_FLAGS)
 	err = llcrypt_prepare_rename(src, src_dchild, tgt, tgt_dchild, flags);
-#else
-	err = llcrypt_prepare_rename(src, src_dchild, tgt, tgt_dchild, 0);
-#endif
 	if (err)
 		GOTO(out, err);
 	/* we prevent an encrypted file from being renamed
@@ -2530,9 +2574,7 @@ const struct inode_operations ll_dir_inode_operations = {
 	.get_inode_acl	= ll_get_inode_acl,
 #endif
 	.get_acl	= ll_get_acl,
-#ifdef HAVE_IOP_SET_ACL
 	.set_acl	= ll_set_acl,
-#endif
 #ifdef HAVE_FILEATTR_GET
 	.fileattr_get	= ll_fileattr_get,
 	.fileattr_set	= ll_fileattr_set,
@@ -2553,7 +2595,5 @@ const struct inode_operations ll_special_inode_operations = {
 	.get_inode_acl	= ll_get_inode_acl,
 #endif
 	.get_acl	= ll_get_acl,
-#ifdef HAVE_IOP_SET_ACL
 	.set_acl	= ll_set_acl,
-#endif
 };
