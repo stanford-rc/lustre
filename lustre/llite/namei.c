@@ -388,8 +388,10 @@ static void ll_lock_cancel_bits(struct ldlm_lock *lock, __u64 to_cancel)
 	    inode->i_sb->s_root && !is_root_inode(inode))
 		ll_prune_aliases(inode);
 
-	if (bits & (MDS_INODELOCK_LOOKUP | MDS_INODELOCK_PERM))
+	if (bits & (MDS_INODELOCK_LOOKUP | MDS_INODELOCK_PERM)) {
 		forget_all_cached_acls(inode);
+		clear_bit(LLIF_ACL_VALID, &lli->lli_flags);
+	}
 
 	iput(inode);
 	RETURN_EXIT;
